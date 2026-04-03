@@ -1,0 +1,72 @@
+import "dotenv/config";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { logger } from "hono/logger";
+import { serve } from "@hono/node-server";
+import { connectDB } from "./lib/mongo";
+import { testRouter } from "./routes/test";
+
+/** Comma-separated in CORS_ORIGIN; first entry is default for non-browser clients. */
+function allowedCorsOrigins(): string[] {
+  const raw = process.env.CORS_ORIGIN || "http://localhost:8080,http://127.0.0.1:8080";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const app = new Hono();
+
+app.use(logger());
+app.use(
+  cors({
+    origin: (origin) => {
+      const allowed = allowedCorsOrigins();
+      if (!origin) return allowed[0];
+      return allowed.includes(origin) ? origin : null;
+    },
+    credentials: true,
+  })
+);
+
+app.route("/test", testRouter);
+
+app.get("/health", (c) => {
+  return c.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+app.notFound((c) => {
+  return c.json({ error: "Not found" }, 404);
+});
+
+app.onError((err, c) => {
+  console.error("Error:", err);
+  return c.json(
+    {
+      error: "Internal server error",
+      message: process.env.NODE_ENV === "development" ? err.message : undefined,
+    },
+    500
+  );
+});
+
+const port = parseInt(process.env.PORT || "3001", 10);
+
+async function startServer() {
+  try {
+    await connectDB();
+    console.log("✅ Database connected");
+
+    serve({
+      fetch: app.fetch,
+      port: port,
+    });
+
+    console.log(`✅ GitLore backend running on http://localhost:${port}`);
+  } catch (error) {
+    console.error("❌ Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
