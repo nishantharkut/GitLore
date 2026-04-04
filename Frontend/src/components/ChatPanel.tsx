@@ -68,10 +68,16 @@ function repoCacheKey(owner: string, name: string): string {
   return `${owner.trim().toLowerCase()}/${name.trim().toLowerCase()}`;
 }
 
-export function ChatPanel({
-  onChatComplete,
-  initialQuestion,
-}: { onChatComplete?: () => void; initialQuestion?: string } = {}) {
+/** BCP 47 tag for Web Speech API; falls back when `navigator.language` is missing. */
+function browserSpeechLang(): string {
+  if (typeof navigator !== "undefined") {
+    const l = navigator.language?.trim();
+    if (l) return l;
+  }
+  return "en-US";
+}
+
+export function ChatPanel({ onChatComplete }: { onChatComplete?: () => void } = {}) {
   const { target, repoReady } = useRepo();
   const location = useLocation();
   const navigate = useNavigate();
@@ -86,7 +92,6 @@ export function ChatPanel({
   const [micBusy, setMicBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const chipsScrollRef = useRef<HTMLDivElement>(null);
-  const appliedPrefill = useRef<string | null>(null);
   const speechOk = browserSpeechRecognitionSupported();
 
   const assistantMarkdownComponents = useMemo(
@@ -316,15 +321,6 @@ export function ChatPanel({
     };
   }, [repoReady, target.owner, target.name]);
 
-  useEffect(() => {
-    const q = initialQuestion?.trim();
-    if (!q || !repoReady) return;
-    if (appliedPrefill.current === q) return;
-    appliedPrefill.current = q;
-    setInput("");
-    void sendChatQuestion(q);
-  }, [initialQuestion, repoReady, sendChatQuestion]);
-
   const handleSend = async () => {
     const q = input.trim();
     if (!q || loading || !repoReady) return;
@@ -517,7 +513,7 @@ export function ChatPanel({
               onClick={() => {
                 if (micBusy || loading || !repoReady) return;
                 setMicBusy(true);
-                void recognizeSpeechOnce()
+                void recognizeSpeechOnce(browserSpeechLang())
                   .then((text) => {
                     const t = text.trim();
                     if (t) setInput((prev) => (prev ? `${prev} ${t}` : t));

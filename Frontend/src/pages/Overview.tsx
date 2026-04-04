@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { FadeIn } from "../components/effects/FadeIn";
 import { ChatPanel } from "../components/ChatPanel";
 import { EnforcementLog } from "../components/EnforcementLog";
@@ -37,7 +37,6 @@ function fmt(n: number) {
 
 const Overview = () => {
   const navigate = useNavigate();
-  const location = useLocation();
   const { user, loading: authLoading } = useAuth();
   const { target, repoFull, setTarget, repoReady } = useRepo();
   const [data, setData] = useState<RepoOverviewResponse | null>(null);
@@ -60,11 +59,6 @@ const Overview = () => {
     if (authLoading || !user || repoReady) return;
     navigate("/repos", { replace: true });
   }, [authLoading, user, repoReady, navigate]);
-
-  const chatPrefill =
-    location.state && typeof (location.state as { chatQuery?: unknown }).chatQuery === "string"
-      ? (location.state as { chatQuery: string }).chatQuery.trim()
-      : undefined;
 
   useEffect(() => {
     if (!user) {
@@ -459,11 +453,7 @@ const Overview = () => {
                 setRefreshChat((p) => p + 1);
               }}
             />
-            <ChatPanel
-              key={refreshChat}
-              initialQuestion={chatPrefill}
-              onChatComplete={() => setEnforcementTick((t) => t + 1)}
-            />
+            <ChatPanel key={refreshChat} onChatComplete={() => setEnforcementTick((t) => t + 1)} />
             <EnforcementLog refreshKey={refreshChat + enforcementTick} />
           </div>
         </div>
