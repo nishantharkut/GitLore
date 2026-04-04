@@ -4,6 +4,7 @@ import {
   getEmbedding,
   GEMINI_GENERATION_MODEL,
   getGoogleGenAI,
+  isGeminiRateLimitError,
   parseModelJson,
   withGemini429Retry,
 } from "./gemini";
@@ -281,19 +282,39 @@ Rules:
 - If no alternatives were discussed, use [].
 - Be concise.`;
 
-  const result = await withGemini429Retry(() =>
-    ai.models.generateContent({
-      model: GEMINI_GENERATION_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: KNOWLEDGE_EXTRACT_SYSTEM,
-        temperature: 0.1,
-        maxOutputTokens: 2048,
-        responseMimeType: "application/json",
-        responseJsonSchema: KNOWLEDGE_RESPONSE_JSON_SCHEMA,
-      },
-    })
-  );
+  const knowledgeExtractConfigBase = {
+    systemInstruction: KNOWLEDGE_EXTRACT_SYSTEM,
+    temperature: 0.1,
+    maxOutputTokens: 2048,
+    responseMimeType: "application/json" as const,
+  };
+
+  let result;
+  try {
+    result = await withGemini429Retry(() =>
+      ai.models.generateContent({
+        model: GEMINI_GENERATION_MODEL,
+        contents: prompt,
+        config: {
+          ...knowledgeExtractConfigBase,
+          responseJsonSchema: KNOWLEDGE_RESPONSE_JSON_SCHEMA,
+        },
+      })
+    );
+  } catch (firstErr) {
+    if (isGeminiRateLimitError(firstErr)) throw firstErr;
+    const hint = firstErr instanceof Error ? firstErr.message : String(firstErr);
+    console.warn(
+      `[ingest] extractKnowledge: responseJsonSchema path failed (${hint.slice(0, 200)}); retrying with JSON mime only`
+    );
+    result = await withGemini429Retry(() =>
+      ai.models.generateContent({
+        model: GEMINI_GENERATION_MODEL,
+        contents: prompt,
+        config: knowledgeExtractConfigBase,
+      })
+    );
+  }
 
   const responseText = result.text;
   if (!responseText) {
