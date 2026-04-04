@@ -52,12 +52,57 @@ export function verifySession(signed: string): string {
   return userId;
 }
 
+const API_KEY_HEADER = "x-gitlore-api-key";
+
+function timingSafeApiKeyEqual(provided: string, expected: string): boolean {
+  if (!provided || !expected || provided.length !== expected.length) {
+    return false;
+  }
+  try {
+    return crypto.timingSafeEqual(Buffer.from(provided, "utf8"), Buffer.from(expected, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Authentication middleware for protected routes
  */
 export async function authMiddleware(c: Context, next: Next): Promise<void | Response> {
   try {
     if (c.req.method === "GET" && c.req.path === "/api/enforcement/policy") {
+      await next();
+      return;
+    }
+
+    const rawApiKey = c.req.header(API_KEY_HEADER)?.trim();
+    if (rawApiKey) {
+      const configuredKey = process.env.SUPERPLANE_API_KEY?.trim();
+      if (!configuredKey || !timingSafeApiKeyEqual(rawApiKey, configuredKey)) {
+        return c.json({ error: "Invalid API key" }, 401);
+      }
+
+      const serviceUsername =
+        process.env.SUPERPLANE_SERVICE_USERNAME?.trim() || "gitlore-service";
+
+      const db = getDB();
+      const apiUser = await db.collection<AuthUser>("users").findOne({
+        username: serviceUsername,
+      });
+
+      if (!apiUser) {
+        return c.json(
+          {
+            error: "Unauthorized",
+            message: `No user with username "${serviceUsername}". Sign in once with that GitHub account or set SUPERPLANE_SERVICE_USERNAME to an existing user's GitHub login.`,
+          },
+          401
+        );
+      }
+
+      const userId = apiUser._id.toString();
+      c.set("user", apiUser);
+      c.set("userId", userId);
       await next();
       return;
     }
