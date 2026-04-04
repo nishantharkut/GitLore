@@ -489,10 +489,9 @@ const NarrativePanel = ({
             {narrative.debateQuotes.map((q, i) => (
               <div
                 key={`quote-${i}`}
-                className="relative overflow-hidden rounded"
+                className="relative overflow-hidden rounded border border-[var(--border-accent)]"
                 style={{
-                  background: "linear-gradient(135deg, rgba(201,168,76,0.06), rgba(30,30,46,0.4))",
-                  border: "1px solid rgba(201,168,76,0.15)",
+                  background: "linear-gradient(135deg, var(--accent-dim), var(--elevated))",
                 }}
               >
                 {/* Left accent bar */}
@@ -574,15 +573,12 @@ const NarrativePanel = ({
           )}
         </div>
 
-        {/* ── Sources + Data Signals ── */}
-        <div
-          className="rounded px-3.5 py-3"
-          style={{ background: "rgba(26,26,42,0.5)", border: "1px solid rgba(255,255,255,0.06)" }}
-        >
+        {/* ── Sources + Data Signals ── (theme tokens — was hardcoded dark panel, broke light mode) */}
+        <div className="rounded border border-gitlore-border bg-[var(--elevated)] px-3.5 py-3">
           {/* Source links */}
           {(narrative.sources.prUrl || narrative.sources.issueUrls.length > 0) && (
             <div className="mb-2.5 flex flex-wrap items-center gap-2">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-gitlore-text-secondary/60">Sources</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-gitlore-text-secondary">Sources</span>
               {narrative.sources.prUrl && (
                 <a
                   href={narrative.sources.prUrl}
@@ -641,10 +637,11 @@ const NarrativePanel = ({
               {narrative.sources.dataSignals.map((signal) => (
                 <span
                   key={signal}
-                  className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium"
-                  style={{ background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.4)" }}
+                  className="inline-flex items-center gap-1 rounded border border-gitlore-border bg-gitlore-surface px-2 py-0.5 text-[10px] font-medium text-gitlore-text-secondary"
                 >
-                  <span style={{ fontSize: 10 }}>{SIGNAL_ICONS[signal] || "·"}</span>
+                  <span className="text-[10px] text-gitlore-text-secondary" aria-hidden>
+                    {SIGNAL_ICONS[signal] || "·"}
+                  </span>
                   {signal.replace(/_/g, " ")}
                 </span>
               ))}
