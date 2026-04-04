@@ -2,13 +2,22 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { FadeIn } from "../components/effects/FadeIn";
 import { ChatPanel } from "../components/ChatPanel";
+import { EnforcementLog } from "../components/EnforcementLog";
 import { IngestButton } from "../components/IngestButton";
 import { KnowledgeDecisionsGraph } from "../components/KnowledgeDecisionsGraph";
 import { invalidateKnowledgeSuggestionsCache } from "../components/KnowledgeSuggestions";
 import { OverviewSkeleton, Spinner } from "../components/Skeleton";
 import { useAuth } from "@/context/AuthContext";
 import { useRepo } from "@/context/RepoContext";
-import { fetchRepoOverview, fetchRepoPullRequests, type RepoOverviewResponse, type RepoPullSummary } from "@/lib/gitloreApi";
+import {
+  fetchRepoAnalytics,
+  fetchRepoOverview,
+  fetchRepoPullRequests,
+  type RepoAnalyticsPayload,
+  type RepoOverviewResponse,
+  type RepoPullSummary,
+} from "@/lib/gitloreApi";
+import { useRealtimeUpdates, formatCacheEventTime } from "@/hooks/useRealtimeUpdates";
 import { startGithubOAuth as oauthNav } from "@/lib/githubOAuth";
 
 const HealthBar = ({ score, max }: { score: number; max: number }) => (
@@ -29,7 +38,7 @@ function fmt(n: number) {
 const Overview = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const { target, repoFull, setTarget, repoReady } = useRepo();
   const [data, setData] = useState<RepoOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -38,8 +47,19 @@ const Overview = () => {
   const [pullsLoading, setPullsLoading] = useState(false);
   const [pullsErr, setPullsErr] = useState<string | null>(null);
   const [refreshChat, setRefreshChat] = useState(0);
+  const [enforcementTick, setEnforcementTick] = useState(0);
   const [showAllPRs, setShowAllPRs] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(false);
+  const [mongoAnalytics, setMongoAnalytics] = useState<RepoAnalyticsPayload | null>(null);
+  const [mongoAnalyticsErr, setMongoAnalyticsErr] = useState<string | null>(null);
+
+  const { events: liveEvents, connected: liveConnected, streamError: liveStreamErr, clearEvents } =
+    useRealtimeUpdates(repoReady ? repoFull : null);
+
+  useEffect(() => {
+    if (authLoading || !user || repoReady) return;
+    navigate("/repos", { replace: true });
+  }, [authLoading, user, repoReady, navigate]);
 
   const chatPrefill =
     location.state && typeof (location.state as { chatQuery?: unknown }).chatQuery === "string"
@@ -104,6 +124,31 @@ const Overview = () => {
       })
       .finally(() => {
         if (!cancelled) setPullsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user, repoReady, target.owner, target.name]);
+
+  useEffect(() => {
+    if (!user || !repoReady) {
+      setMongoAnalytics(null);
+      setMongoAnalyticsErr(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchRepoAnalytics(target.owner, target.name)
+      .then((payload) => {
+        if (!cancelled) {
+          setMongoAnalytics(payload);
+          setMongoAnalyticsErr(null);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setMongoAnalytics(null);
+          setMongoAnalyticsErr(e instanceof Error ? e.message : "Analytics unavailable");
+        }
       });
     return () => {
       cancelled = true;
@@ -249,6 +294,104 @@ const Overview = () => {
               <HealthBar score={data?.healthScore ?? 0} max={10} />
             </div>
 
+            <div className="rounded-sm border border-gitlore-border bg-gitlore-surface p-4">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-xs font-medium uppercase tracking-wider text-gitlore-text-secondary">
+                  Live activity
+                </div>
+                <div className="flex items-center gap-2 text-[11px] text-gitlore-text-secondary">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${liveConnected ? "bg-gitlore-success" : "bg-gitlore-text-secondary/40"}`}
+                    aria-hidden
+                  />
+                  {liveConnected ? "Connected" : liveStreamErr ? "Offline" : "Connecting…"}
+                </div>
+              </div>
+              {liveStreamErr && (
+                <p className="mb-2 text-xs text-gitlore-text-secondary">{liveStreamErr}</p>
+              )}
+              {liveEvents.length === 0 && !liveStreamErr && (
+                <p className="text-sm text-gitlore-text-secondary">
+                  New review explanations will appear here as they are cached for this repo.
+                </p>
+              )}
+              <ul className="max-h-52 space-y-2 overflow-y-auto">
+                {liveEvents.map((ev, i) => (
+                  <li key={`${ev.timestamp}-${i}`} className="border-b border-gitlore-border/60 pb-2 text-sm last:border-0 last:pb-0">
+                    <div className="font-code text-gitlore-text">
+                      {ev.file_path || "—"}
+                      {ev.line != null ? `:${ev.line}` : ""} — {ev.pattern_name || "Explanation cached"}
+                    </div>
+                    <div className="mt-0.5 text-xs text-gitlore-text-secondary">
+                      <span className="uppercase">{ev.confidence}</span> confidence · {formatCacheEventTime(ev.timestamp)}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              {liveEvents.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => clearEvents()}
+                  className="mt-2 text-xs text-gitlore-accent hover:text-gitlore-accent-hover"
+                >
+                  Clear list
+                </button>
+              ) : null}
+            </div>
+
+            {mongoAnalyticsErr && (
+              <p className="text-xs text-gitlore-text-secondary">{mongoAnalyticsErr}</p>
+            )}
+            {mongoAnalytics && !mongoAnalyticsErr ? (
+              <div className="rounded-sm border border-gitlore-border bg-gitlore-surface p-4">
+                <div className="mb-2 text-xs font-medium uppercase tracking-wider text-gitlore-text-secondary">
+                  Cached analyses (MongoDB)
+                </div>
+                {(() => {
+                  const t = mongoAnalytics.analytics.totals[0];
+                  return (
+                    <p className="mb-3 text-sm text-gitlore-text">
+                      <span className="font-medium">{t?.totalAnalyses ?? 0}</span> line analyses across{" "}
+                      <span className="font-medium">{t?.uniqueFiles ?? 0}</span> files
+                      {t != null && t.uniqueAuthors > 0 ? (
+                        <>
+                          {" "}
+                          · <span className="font-medium">{t.uniqueAuthors}</span> authors in blame
+                        </>
+                      ) : null}
+                      .
+                    </p>
+                  );
+                })()}
+                {mongoAnalytics.analytics.dataSignals.length > 0 && (
+                  <div className="mb-2">
+                    <div className="text-[11px] uppercase text-gitlore-text-secondary">Data signals</div>
+                    <ul className="mt-1 flex flex-wrap gap-2 text-xs">
+                      {mongoAnalytics.analytics.dataSignals.slice(0, 6).map((s) => (
+                        <li key={s._id} className="rounded-sm bg-gitlore-bg px-2 py-0.5 font-code text-gitlore-text">
+                          {s._id}{" "}
+                          <span className="text-gitlore-text-secondary">({s.count})</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {mongoAnalytics.patterns.length > 0 && (
+                  <div>
+                    <div className="text-[11px] uppercase text-gitlore-text-secondary">Explain cache · top patterns</div>
+                    <ul className="mt-1 space-y-1 text-sm text-gitlore-text">
+                      {mongoAnalytics.patterns.slice(0, 5).map((p) => (
+                        <li key={String(p._id)} className="flex justify-between gap-2">
+                          <span className="min-w-0 truncate">{p._id || "—"}</span>
+                          <span className="shrink-0 text-gitlore-text-secondary">{p.count}×</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            ) : null}
+
             <div>
               <div className="mb-3 text-xs font-medium uppercase tracking-wider text-gitlore-text-secondary">Patterns (from cached reviews)</div>
               <div className="space-y-2">
@@ -316,7 +459,12 @@ const Overview = () => {
                 setRefreshChat((p) => p + 1);
               }}
             />
-            <ChatPanel key={refreshChat} initialQuestion={chatPrefill} />
+            <ChatPanel
+              key={refreshChat}
+              initialQuestion={chatPrefill}
+              onChatComplete={() => setEnforcementTick((t) => t + 1)}
+            />
+            <EnforcementLog refreshKey={refreshChat + enforcementTick} />
           </div>
         </div>
       </div>

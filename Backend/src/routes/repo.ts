@@ -8,6 +8,10 @@ import {
   getRepositoryStats,
 } from "../lib/github";
 import {
+  getRepoAnalytics,
+  getPatternDistribution,
+} from "../lib/mongoAdvanced";
+import {
   enrichRepositoryOverview,
   aggregatePatternCounts,
   aggregateRepoPatternInsights,
@@ -19,6 +23,7 @@ import {
   listPullRequestsRest,
   getPullRequestDiffRest,
   listPullRequestReviewCommentsRest,
+  listPullRequestFilesRest,
   getPullRequestRest,
   fetchRepositoryMetadataRest,
   searchRepoCountRest,
@@ -28,6 +33,41 @@ import {
 import { getOrScanRepoPatterns } from "../lib/patternScanner";
 
 export const repoRouter = new Hono();
+
+/**
+ * GET /api/repo/analytics?repo=owner/name
+ * Mongo aggregation: line-analyze cache stats + explanation pattern distribution.
+ */
+repoRouter.get("/repo/analytics", async (c) => {
+  try {
+    const user = getCurrentUser(c);
+    if (!user) return c.json({ error: "Not authenticated" }, 401);
+
+    const repo = c.req.query("repo")?.trim();
+    if (!repo) {
+      return c.json({ error: "repo query param required" }, 400);
+    }
+
+    const [analytics, patterns] = await Promise.all([
+      getRepoAnalytics(repo),
+      getPatternDistribution(repo),
+    ]);
+
+    return c.json({ analytics, patterns });
+  } catch (error) {
+    console.error("repo/analytics error:", error);
+    return c.json(
+      {
+        error: "Failed to load repo analytics",
+        message:
+          process.env.NODE_ENV === "development" && error instanceof Error
+            ? error.message
+            : undefined,
+      },
+      500
+    );
+  }
+});
 
 /**
  * GET /api/user/github-profile — followers, repos, etc. for the signed-in user.
@@ -367,10 +407,11 @@ repoRouter.get("/repo/:owner/:name/pulls/:number/diff-review", async (c) => {
       return c.json({ error: "Invalid parameters" }, 400);
     }
 
-    const [detail, diff, comments] = await Promise.all([
+    const [detail, diff, comments, files] = await Promise.all([
       getPullRequestRest(user.access_token, owner, name, pullNumber),
       getPullRequestDiffRest(user.access_token, owner, name, pullNumber),
       listPullRequestReviewCommentsRest(user.access_token, owner, name, pullNumber),
+      listPullRequestFilesRest(user.access_token, owner, name, pullNumber),
     ]);
 
     return c.json({
@@ -380,15 +421,35 @@ repoRouter.get("/repo/:owner/:name/pulls/:number/diff-review", async (c) => {
       authorLogin: detail.user?.login || null,
       updatedAt: detail.updated_at,
       htmlUrl: detail.html_url,
-      diff,
-      comments: comments.map((x) => ({
-        id: x.id,
-        path: x.path,
-        line: x.line,
-        body: x.body,
-        author: x.user?.login || "unknown",
-        diff_hunk: x.diff_hunk,
+      head: { ref: detail.head.ref, sha: detail.head.sha },
+      base: { ref: detail.base.ref, sha: detail.base.sha },
+      files: files.map((f) => ({
+        filename: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
       })),
+      diff,
+      comments: comments.map((x) => {
+        const raw = x as {
+          line?: number | null;
+          original_line?: number | null;
+          start_line?: number | null;
+        };
+        const line =
+          raw.line ??
+          raw.start_line ??
+          raw.original_line ??
+          null;
+        return {
+          id: x.id,
+          path: x.path,
+          line,
+          body: x.body,
+          author: x.user?.login || "unknown",
+          diff_hunk: x.diff_hunk,
+        };
+      }),
     });
   } catch (error) {
     console.error("diff-review error:", error);

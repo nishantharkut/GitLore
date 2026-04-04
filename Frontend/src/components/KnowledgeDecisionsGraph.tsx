@@ -11,6 +11,11 @@ import { Maximize2, RotateCcw, X, ZoomIn, ZoomOut } from "lucide-react";
 import { useRepo } from "@/context/RepoContext";
 import { useTheme, type ThemeMode } from "@/context/ThemeContext";
 import { fetchKnowledgeLayout, type KnowledgeLayoutResponse } from "@/lib/gitloreApi";
+import {
+  clearKnowledgeLayoutCache,
+  loadKnowledgeLayoutCache,
+  saveKnowledgeLayoutCache,
+} from "@/lib/overviewSessionCache";
 
 /** Normalize owner/name the same way the backend builds `repo` on nodes. */
 function repoLayoutKey(owner: string, name: string) {
@@ -521,7 +526,6 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
   const [view, setView] = useState<GraphView>({ zoom: 1, x: 0, y: 0 });
   const [modalView, setModalView] = useState<GraphView>({ zoom: 1, x: 0, y: 0 });
   const [modalOpen, setModalOpen] = useState(false);
-
   const lastRepoKeyRef = useRef<string | null>(null);
   const prevRefreshKeyRef = useRef(refreshKey);
   const dimsRef = useRef({ w: 1000, h: 640 });
@@ -547,7 +551,8 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
       return;
     }
 
-    const key = repoLayoutKey(target.owner, target.name);
+    const { owner, name } = target;
+    const key = repoLayoutKey(owner, name);
     const switchedRepo =
       lastRepoKeyRef.current !== null && lastRepoKeyRef.current !== key;
     lastRepoKeyRef.current = key;
@@ -561,10 +566,15 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
     prevRefreshKeyRef.current = refreshKey;
     if (refreshBumped) {
       knowledgeLayoutCache.delete(key);
+      clearKnowledgeLayoutCache(owner, name);
     }
 
-    const cached = knowledgeLayoutCache.get(key);
+    const cached =
+      !refreshBumped
+        ? knowledgeLayoutCache.get(key) ?? loadKnowledgeLayoutCache(owner, name)
+        : null;
     if (cached?.nodes?.length) {
+      knowledgeLayoutCache.set(key, cached);
       setLayout(cached);
     }
 
@@ -577,10 +587,11 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
     }
     setErr(null);
 
-    void fetchKnowledgeLayout(target.owner, target.name)
+    void fetchKnowledgeLayout(owner, name)
       .then((res) => {
         if (cancelled) return;
         knowledgeLayoutCache.set(key, res);
+        saveKnowledgeLayoutCache(owner, name, res);
         setLayout(res);
         setErr(null);
       })
@@ -590,8 +601,10 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
         setErr(msg);
         setLayout((prev) => {
           if (prev?.nodes?.length) return prev;
-          const fromCache = knowledgeLayoutCache.get(key);
-          if (fromCache?.nodes?.length) return fromCache;
+          const fromMemory = knowledgeLayoutCache.get(key);
+          if (fromMemory?.nodes?.length) return fromMemory;
+          const fromLs = loadKnowledgeLayoutCache(owner, name);
+          if (fromLs?.nodes?.length) return fromLs;
           return prev;
         });
       })
@@ -844,6 +857,8 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
 
   if (!repoReady) return null;
 
+  const showLoadingOverlay = loading && !hasGraph;
+
   return (
     <div className="rounded-sm border border-gitlore-border bg-gitlore-surface">
       <div className="border-b border-gitlore-border px-4 py-3">
@@ -861,7 +876,7 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
       </div>
 
       <div className="relative w-full p-2 md:p-3">
-        {loading && !hasGraph && (
+        {showLoadingOverlay && (
           <div className="flex min-h-[280px] items-center justify-center text-sm text-gitlore-text-secondary">
             Loading graph…
           </div>

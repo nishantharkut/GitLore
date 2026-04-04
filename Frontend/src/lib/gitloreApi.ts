@@ -32,12 +32,28 @@ export interface InsightNarrative {
 
 export interface InsightExplanation {
   header: string;
+  /** Pattern title (same as header from API pattern_name) */
+  patternName?: string;
+  /** Human-readable issue description */
+  whatsWrong: string;
+  /** Left pane / buggy side (often from diff or whats_wrong) */
   buggyCode: string;
+  /** Suggested fix from model */
   fixedCode: string;
   why: string;
+  whyItMatters?: string;
   principle: string;
   link: string;
+  docsLinks: string[];
   confidence: "HIGH" | "MEDIUM" | "LOW";
+  confidenceReason?: string;
+  source?: {
+    commentBy: string;
+    commentUrl: string;
+    patternMatched: string | null;
+  };
+  /** PR number for footer line */
+  prNumber?: number;
 }
 
 const TIMELINE_COLORS = ["#E74C3C", "#C9A84C", "#F39C12", "#2ECC71"];
@@ -108,7 +124,7 @@ export function narrativeFromAnalyzeApi(raw: Record<string, unknown>): InsightNa
         return {
           color,
           label: `PR #${num}`,
-          sublabel: trunc(title, 36),
+          sublabel: trunc(title, 24),
           date: typeof date === "string" && date !== "open" ? new Date(date).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : (date === "open" ? "open" : ""),
         };
       }
@@ -119,7 +135,7 @@ export function narrativeFromAnalyzeApi(raw: Record<string, unknown>): InsightNa
         return {
           color,
           label: num ? `Issue #${num}` : trunc(title, 28),
-          sublabel: num ? trunc(title, 36) : "Issue",
+          sublabel: num ? trunc(title, 24) : "Issue",
           date: date ? new Date(date).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "",
         };
       }
@@ -162,15 +178,30 @@ export function explanationFromApi(raw: Record<string, unknown>): InsightExplana
   const principle = (raw.principle as string) || "";
   const docs = raw.docs_links as string[] | undefined;
   const linkFromDocs = Array.isArray(docs) && docs[0] ? String(docs[0]).replace(/^https?:\/\//, "") : "";
+  const src = raw.source as
+    | { comment_by?: string; comment_url?: string; pattern_matched?: string | null }
+    | undefined;
 
   return {
     header: pattern,
+    patternName: pattern,
+    whatsWrong,
     buggyCode: whatsWrong || "(no snippet)",
     fixedCode: fix || "(no fix suggested)",
     why,
+    whyItMatters: why,
     principle: principle || "Code review",
     link: linkFromDocs || "developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch",
+    docsLinks: Array.isArray(docs) ? docs : [],
     confidence: confUpper(raw.confidence as string),
+    confidenceReason: (raw.confidence_reason as string) || "",
+    source: src
+      ? {
+          commentBy: src.comment_by || "",
+          commentUrl: src.comment_url || "",
+          patternMatched: src.pattern_matched ?? null,
+        }
+      : undefined,
   };
 }
 
@@ -221,6 +252,10 @@ export async function postJSON<T>(path: string, body: unknown): Promise<T> {
   return data as T;
 }
 
+export async function postNarrate(text: string): Promise<{ status?: string; message?: string }> {
+  return postJSON("/api/narrate", { text });
+}
+
 export async function analyzeLine(body: {
   repo: string;
   file_path: string;
@@ -241,6 +276,73 @@ export async function explainComment(body: {
 }): Promise<InsightExplanation> {
   const raw = await postJSON<Record<string, unknown>>("/api/explain", body);
   return explanationFromApi(raw);
+}
+
+/** ReviewLens auto-fix (classify + tiered fixes). */
+export type AutoFixClassification = "AUTO_FIXABLE" | "SUGGEST_FIX" | "MANUAL_REVIEW" | "COMPLEX";
+
+export type AutoFixClassifiedRow = {
+  comment_id: number;
+  path: string;
+  line: number;
+  author: string;
+  body: string;
+  classification: AutoFixClassification;
+  score: number;
+  signals: {
+    text_pattern: { category: string; score: number };
+    suggestion_block: { found: boolean; score: number; preview?: string };
+    diff_scope: { estimated_lines: number; score: number };
+    reviewer_type: { is_bot: boolean; score: number };
+    pattern_match: { pattern: string | null; score: number };
+  };
+  fix: {
+    tier: 1 | 2 | 3;
+    tier_label: "extracted" | "rule-based" | "ai-generated";
+    original_code: string;
+    fixed_code: string;
+    description: string;
+    validation: { passed: boolean; warnings: string[] };
+  } | null;
+};
+
+export type AutoFixClassifyResponse = {
+  pr_number: number;
+  total_comments: number;
+  classified: AutoFixClassifiedRow[];
+  summary: {
+    auto_fixable: number;
+    suggest_fix: number;
+    manual_review: number;
+    complex: number;
+  };
+};
+
+export async function postAutoFixClassify(owner: string, name: string, pullNumber: number): Promise<AutoFixClassifyResponse> {
+  return postJSON<AutoFixClassifyResponse>(
+    `/api/repo/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/pulls/${pullNumber}/auto-fix/classify`,
+    {}
+  );
+}
+
+export type AutoFixApplyResponse = {
+  status: string;
+  branch: string;
+  draft_pr: { number: number; url: string; title: string };
+  applied: Array<{ comment_id: number; commit_sha: string; file: string; tier: number }>;
+  failed: Array<{ comment_id: number; reason: string }>;
+};
+
+export async function postAutoFixApply(
+  owner: string,
+  name: string,
+  pullNumber: number,
+  body: { comment_ids: number[]; branch_name?: string }
+): Promise<AutoFixApplyResponse> {
+  return postJSON<AutoFixApplyResponse>(
+    `/api/repo/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/pulls/${pullNumber}/auto-fix/apply`,
+    body
+  );
 }
 
 export interface SearchResultItem {
@@ -458,6 +560,32 @@ export async function fetchRepoPatternScan(
   );
 }
 
+export type RepoAnalyticsPayload = {
+  analytics: {
+    confidenceBreakdown: Array<{ _id: string | null; count: number }>;
+    dataSignals: Array<{ _id: string; count: number }>;
+    fileHeatmap: Array<{
+      _id: string | null;
+      analysisCount: number;
+      avgConfidence: number | null;
+    }>;
+    timeline: Array<{ _id: string; count: number }>;
+    totals: Array<{
+      totalAnalyses: number;
+      uniqueFiles: number;
+      uniqueAuthors: number;
+    }>;
+  };
+  patterns: Array<{ _id: string | null; count: number; avgConfidence: number | null }>;
+};
+
+export async function fetchRepoAnalytics(owner: string, name: string): Promise<RepoAnalyticsPayload> {
+  const repo = `${owner}/${name}`;
+  return getJSON<RepoAnalyticsPayload>(
+    `/api/repo/analytics?repo=${encodeURIComponent(repo)}`
+  );
+}
+
 export type GithubUserProfile = {
   login: string;
   name: string | null;
@@ -492,6 +620,18 @@ export async function fetchRepoPullRequests(
   return data.pulls || [];
 }
 
+export type PullDiffReviewRef = {
+  ref: string;
+  sha: string;
+};
+
+export type PullDiffReviewFile = {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+};
+
 export type PullDiffReviewResponse = {
   number: number;
   title: string;
@@ -499,6 +639,9 @@ export type PullDiffReviewResponse = {
   authorLogin: string | null;
   updatedAt: string;
   htmlUrl: string;
+  head: PullDiffReviewRef;
+  base: PullDiffReviewRef;
+  files: PullDiffReviewFile[];
   diff: string;
   comments: Array<{
     id: number;
@@ -756,4 +899,43 @@ export async function postVoiceTts(
     blob: base64ToBlob(data.audioBase64, data.mimeType || "audio/mpeg"),
     displayText: data.displayText,
   };
+}
+
+export type EnforcementLogEntry = {
+  timestamp: string;
+  user: string;
+  repo: string;
+  plan_id: string;
+  tool: string;
+  params: Record<string, unknown>;
+  action: "allow" | "deny";
+  reason: string;
+  policy_rule: string;
+  risk_level: string;
+  intent_token_id: string;
+  response_time_ms: number;
+  phase?: string;
+};
+
+export async function fetchEnforcementLogs(
+  owner: string,
+  name: string,
+  limit = 20
+): Promise<{ logs: EnforcementLogEntry[]; count: number }> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  return getJSON<{ logs: EnforcementLogEntry[]; count: number }>(
+    `/api/enforcement/logs/${encodeURIComponent(owner)}/${encodeURIComponent(name)}?${q}`
+  );
+}
+
+export async function postEnforcementTest(body: {
+  tool: string;
+  params?: Record<string, unknown>;
+  repo: string;
+}): Promise<{ allowed: boolean; reason: string; policy_rule: string; risk_level: string }> {
+  return postJSON("/api/enforcement/test", body);
+}
+
+export async function fetchEnforcementPolicy(): Promise<Record<string, unknown>> {
+  return getJSON<Record<string, unknown>>("/api/enforcement/policy");
 }

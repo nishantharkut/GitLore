@@ -1,8 +1,16 @@
-import { GoogleGenerativeAI, TaskType } from "@google/generative-ai";
+import { GoogleGenAI, FinishReason } from "@google/genai";
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+/** Shared Gemini API client (Gemini Developer API). Prefer this over the deprecated `@google/generative-ai` package. */
+let _googleGenAI: GoogleGenAI | null = null;
+export function getGoogleGenAI(): GoogleGenAI {
+  if (!_googleGenAI) {
+    _googleGenAI = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY?.trim() || "",
+    });
+  }
+  return _googleGenAI;
+}
 
 /**
  * Text generation (PR knowledge extraction, narratives, review explanations).
@@ -13,6 +21,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
  */
 export const GEMINI_GENERATION_MODEL =
   process.env.GEMINI_GENERATION_MODEL?.trim() || "gemini-2.5-flash-lite";
+
+/** Prefer gemini-2.5-flash for PR comment explanations when set. */
+export const GEMINI_EXPLAIN_MODEL =
+  process.env.GEMINI_EXPLAIN_MODEL?.trim() || "gemini-2.5-flash";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -102,6 +114,149 @@ export async function withGemini429Retry<T>(
   throw lastErr;
 }
 
+/** Node's console.error → util.inspect can throw on some Google SDK error shapes. */
+function safeErrText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object" && "message" in err) {
+    try {
+      return String((err as { message: unknown }).message);
+    } catch {
+      return "[unreadable .message]";
+    }
+  }
+  try {
+    return String(err);
+  } catch {
+    return "[unknown error]";
+  }
+}
+
+function logGeminiFailure(label: string, err: unknown): void {
+  console.error(`${label}: ${safeErrText(err)}`);
+  if (err instanceof Error && err.stack) console.error(err.stack);
+}
+
+/**
+ * First balanced top-level `{ ... }`, respecting JSON string literals so `{`/`}` inside
+ * strings do not break matching (the old brace-count approach corrupted many model replies).
+ */
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (inString) {
+      if (c === "\\") escape = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/** Turn raw newlines inside JSON string values into `\n` so JSON.parse succeeds. */
+function escapeNewlinesInsideJsonStrings(jsonStr: string): string {
+  let out = "";
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < jsonStr.length; i++) {
+    const c = jsonStr[i];
+    if (escape) {
+      out += c;
+      escape = false;
+      continue;
+    }
+    if (inString) {
+      if (c === "\\") {
+        out += c;
+        escape = true;
+        continue;
+      }
+      if (c === '"') {
+        inString = false;
+        out += c;
+        continue;
+      }
+      if (c === "\n" || c === "\r") {
+        if (c === "\r" && jsonStr[i + 1] === "\n") i += 1;
+        out += "\\n";
+        continue;
+      }
+      out += c;
+      continue;
+    }
+    if (c === '"') inString = true;
+    out += c;
+  }
+  return out;
+}
+
+function prepareGeminiJsonText(responseText: string): string {
+  let s = responseText.trim();
+  const fence = s.match(/```(?:json)?\n?([\s\S]*?)\n?```/);
+  if (fence) s = fence[1].trim();
+
+  const extracted = extractFirstJsonObject(s);
+  if (extracted) s = extracted;
+  else {
+    const jsonStart = s.indexOf("{");
+    if (jsonStart !== -1) s = s.slice(jsonStart);
+  }
+
+  return escapeNewlinesInsideJsonStrings(s);
+}
+
+function parseModelJson<T>(responseText: string, schema: z.ZodType<T>): T {
+  const jsonStr = prepareGeminiJsonText(responseText);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (e) {
+    const t = safeErrText(e);
+    const truncated =
+      /unterminated string|unexpected end of json/i.test(t) ||
+      extractFirstJsonObject(jsonStr) === null;
+    const hint = truncated
+      ? " Model output may be truncated (timeout, maxOutputTokens, or slow response)."
+      : "";
+    throw new Error(`Invalid JSON from model:${hint} ${t}`);
+  }
+  return schema.parse(parsed);
+}
+
+const structuredJsonGenerationConfig = {
+  maxOutputTokens: 8192,
+  temperature: 0.25,
+};
+
+/** v1beta + responseMimeType yields valid JSON from Gemini (avoids truncated prose-style replies). */
+const explainJsonGenerationConfig = {
+  maxOutputTokens: 16_384,
+  temperature: 0.12,
+  responseMimeType: "application/json",
+} as const;
+
+function clipForPrompt(label: string, text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n\n[${label} truncated at ${maxChars} characters]`;
+}
+
 // Schema for explanation responses
 export const explanationSchema = z.object({
   pattern_name: z.string(),
@@ -110,10 +265,20 @@ export const explanationSchema = z.object({
   fix: z.string(),
   principle: z.string(),
   confidence: z.enum(["high", "medium", "low"]),
-  confidence_reason: z.string().optional(),
+  confidence_reason: z.string(),
+  docs_links: z.array(z.string()).optional(),
 });
 
 export type Explanation = z.infer<typeof explanationSchema>;
+
+export type ExplainCommentInput = {
+  comment: string;
+  diffHunk: string;
+  filePath: string;
+  language: string;
+  surroundingContext: string;
+  patternTemplate: string | null;
+};
 
 // Schema for narrative responses
 export const narrativeSchema = z.object({
@@ -153,145 +318,183 @@ export const narrativeSchema = z.object({
 
 export type Narrative = z.infer<typeof narrativeSchema>;
 
+const EXPLAIN_SYSTEM = `You are a code review mentor. Given a terse review comment and surrounding code context, explain exactly what is wrong in THIS specific code (not generically), why it matters in production, and provide the corrected code. Reference actual variable names and function names from the code shown.
+
+JSON rules (critical): You must output valid JSON only. Do not put raw double-quote characters inside any string value — use single quotes for quoted snippets or escape as \\". Keep each text field under 1200 characters; prefer concise paragraphs. Use \\n inside strings for line breaks in code samples. Never be generic.`;
+
 /**
- * Generate explanation for a code review comment
+ * Generate explanation for a code review comment (Gemini 2.5 Flash structured JSON).
  */
-export async function explainComment(
-  comment: string,
-  diffHunk: string,
-  filePath: string,
-  context: string
-): Promise<Explanation> {
-  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
+export async function explainComment(input: ExplainCommentInput): Promise<Explanation> {
+  const ai = getGoogleGenAI();
 
-  const prompt = `Respond ONLY with valid JSON (no other text).
+  const patternBlock = input.patternTemplate
+    ? `\nMatched pattern template:\n${clipForPrompt("pattern", input.patternTemplate, 6000)}\n`
+    : "";
 
-{
-  "pattern_name": "Anti-pattern name",
-  "whats_wrong": "What's wrong (use \\n for newlines)",
-  "why_it_matters": "Why it matters",
-  "fix": "Fixed code (use \\n for newlines, \\t for tabs)",
-  "principle": "Principle",
-  "confidence": "high",
-  "confidence_reason": "Reason"
-}
+  const diffHunk = clipForPrompt("Diff hunk", input.diffHunk, 14_000);
+  const surrounding = input.surroundingContext
+    ? clipForPrompt("Surrounding context", input.surroundingContext, 14_000)
+    : "(unavailable)";
 
-Review: "${comment}"
-File: ${filePath}
+  const prompt = `${EXPLAIN_SYSTEM}
 
-Problem code (use exactly as provided):
+Respond with a single JSON object (no markdown fences) using exactly these keys:
+pattern_name, whats_wrong, why_it_matters, fix, principle, confidence (one of: high, medium, low), confidence_reason, docs_links (array of URL strings, may be empty).
+
+Terse review comment: ${JSON.stringify(input.comment)}
+File path: ${input.filePath}
+Language (inferred): ${input.language}
+
+Diff hunk (added lines start with +, removed with -):
 ${diffHunk}
 
-${context ? `Context: ${context}` : ""}
+Surrounding file context (±30 lines around the comment line):
+${surrounding}
+${patternBlock}`;
 
-RESPOND IMMEDIATELY WITH JSON (nothing else):`;
+  const emptyExplanation = (): Explanation => ({
+    pattern_name: "Unknown Pattern",
+    whats_wrong:
+      "Unable to analyze this comment at this time. Please provide more context.",
+    why_it_matters: "Cannot determine impact without sufficient context.",
+    fix: "N/A",
+    principle: "Code Review",
+    confidence: "low",
+    confidence_reason: "Insufficient context provided",
+    docs_links: [],
+  });
 
-  try {
-    const result = await withGemini429Retry(() =>
-      model.generateContent({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
+  const runGenerate = (text: string) =>
+    withGemini429Retry(() =>
+      ai.models.generateContent({
+        model: GEMINI_EXPLAIN_MODEL,
+        contents: text,
+        config: {
+          ...explainJsonGenerationConfig,
+        },
       })
     );
 
-    const responseText =
-      result.response.candidates?.[0]?.content?.parts?.[0]?.text;
+  try {
+    let result = await runGenerate(prompt);
+    let responseText = result.text ?? "";
 
     if (!responseText) {
-      return {
-        pattern_name: "Unknown Pattern",
-        whats_wrong:
-          "Unable to analyze this comment at this time. Please provide more context.",
-        why_it_matters: "Cannot determine impact without sufficient context.",
-        fix: "N/A",
-        principle: "Code Review",
-        confidence: "low",
-        confidence_reason: "Insufficient context provided",
-      };
+      return emptyExplanation();
     }
 
-    // Parse JSON from response - try multiple extraction methods
-    let jsonStr = responseText.trim();
-    
-    // Try markdown code block
-    let match = jsonStr.match(/```(?:json)?\n?([\s\S]*?)\n?```/);
-    if (match) {
-      jsonStr = match[1].trim();
+    const finishReason = result.candidates?.[0]?.finishReason;
+    const needsCompactRetry = finishReason === FinishReason.MAX_TOKENS;
+
+    const tryParse = (t: string) => parseModelJson(t, explanationSchema);
+
+    if (!needsCompactRetry) {
+      try {
+        return tryParse(responseText);
+      } catch (e) {
+        console.warn(
+          `[explain] JSON parse failed, retrying compact: ${safeErrText(e)}`
+        );
+      }
     } else {
-      // Try to find JSON object in response
-      const jsonStart = jsonStr.indexOf("{");
-      if (jsonStart !== -1) {
-        // Find the matching closing brace
-        let braceCount = 0;
-        let endIdx = jsonStart;
-        for (let i = jsonStart; i < jsonStr.length; i++) {
-          if (jsonStr[i] === "{") braceCount++;
-          if (jsonStr[i] === "}") braceCount--;
-          if (braceCount === 0) {
-            endIdx = i;
-            break;
-          }
-        }
-        if (endIdx > jsonStart) {
-          jsonStr = jsonStr.substring(jsonStart, endIdx + 1);
-        }
-      }
+      console.warn("[explain] MAX_TOKENS — retrying with compact prompt");
     }
 
-    // Clean up: replace literal newlines inside strings with escaped versions
-    // This is a bit hacky but handles Gemini's sometimes-unescaped newlines
-    let i = 0;
-    let cleaned = "";
-    let inString = false;
-    let escapeNext = false;
+    const compactPrompt = `${EXPLAIN_SYSTEM}
 
-    for (i = 0; i < jsonStr.length; i++) {
-      const char = jsonStr[i];
-      const prevChar = i > 0 ? jsonStr[i - 1] : "";
+Your previous structured reply was too long or invalid JSON. Reply with ONE compact JSON object only (same keys as before). Each string value max 500 characters. Escape every " inside strings as \\". No markdown.
 
-      if (escapeNext) {
-        cleaned += char;
-        escapeNext = false;
-        continue;
-      }
+Review comment: ${JSON.stringify(input.comment)}
+File: ${input.filePath}
+Language: ${input.language}
+Diff excerpt:
+${clipForPrompt("diff", input.diffHunk, 3500)}`;
 
-      if (char === "\\") {
-        cleaned += char;
-        escapeNext = true;
-        continue;
-      }
-
-      if (char === '"' && prevChar !== "\\") {
-        inString = !inString;
-        cleaned += char;
-        continue;
-      }
-
-      if (inString && (char === "\n" || char === "\r")) {
-        // Inside a string, replace newlines with \n
-        if (char === "\r" && jsonStr[i + 1] === "\n") {
-          i++; // Skip the \n in \r\n
-        }
-        cleaned += "\\n";
-      } else {
-        cleaned += char;
-      }
+    result = await runGenerate(compactPrompt);
+    responseText = result.text ?? "";
+    if (!responseText) {
+      throw new Error("Empty response after compact explain retry");
     }
-
-    jsonStr = cleaned;
-
-    const parsed = JSON.parse(jsonStr);
-    const validated = explanationSchema.parse(parsed);
-
-    return validated;
+    return tryParse(responseText);
   } catch (error) {
-    console.error("Error generating explanation:", error);
-    if (error instanceof Error) {
-      console.error("Error message:", error.message);
-      console.error("Error stack:", error.stack);
-    }
+    logGeminiFailure("Error generating explanation", error);
     throw new Error(
-      `Failed to generate explanation from Gemini: ${error instanceof Error ? error.message : String(error)}`
+      `Failed to generate explanation from Gemini: ${safeErrText(error)}`
     );
+  }
+}
+
+const minimalFixSchema = z.object({
+  result: z.enum(["ok", "COMPLEX", "UNCERTAIN"]),
+  new_region: z.string().optional(),
+});
+
+export type MinimalFixInput = {
+  comment: string;
+  filePath: string;
+  language: string;
+  regionStartLine: number;
+  regionEndLine: number;
+  regionSource: string;
+};
+
+/**
+ * Tier-3 auto-fix: minimal edit only. Returns replacement text for the given line range, or refusal.
+ */
+export async function generateMinimalFix(
+  input: MinimalFixInput
+): Promise<
+  { ok: true; newRegion: string } | { ok: false; reason: "complex" | "uncertain" | "error" }
+> {
+  const key = process.env.GEMINI_API_KEY?.trim();
+  if (!key) return { ok: false, reason: "error" };
+
+  const ai = getGoogleGenAI();
+  const sys = `You are a code review auto-fixer. Generate the MINIMAL change to address the review comment.
+
+Rules:
+- Change as FEW lines as possible within the region shown (ideally 1–5 lines).
+- NEVER refactor code outside what the comment asks.
+- NEVER add features beyond the comment.
+- Return JSON only with keys: result ("ok" | "COMPLEX" | "UNCERTAIN"), new_region (string, only when result is "ok").
+- new_region must be the FULL replacement text for lines ${input.regionStartLine}–${input.regionEndLine} inclusive (same number of logical lines as that range, or fewer if deleting lines). Use \\n for newlines inside the string.
+- If the fix needs more than ~15 changed lines or you are not confident, use COMPLEX or UNCERTAIN instead of ok.
+- Do not wrap new_region in markdown fences inside the JSON string.`;
+
+  const prompt = `${sys}
+
+File: ${input.filePath}
+Language: ${input.language}
+Comment: ${JSON.stringify(input.comment)}
+
+Replace lines ${input.regionStartLine}–${input.regionEndLine} (inclusive). Current region:
+---
+${clipForPrompt("region", input.regionSource, 12_000)}
+---
+
+Respond with one JSON object: { "result": "ok"|"COMPLEX"|"UNCERTAIN", "new_region": "..." }`;
+
+  try {
+    const result = await withGemini429Retry(() =>
+      ai.models.generateContent({
+        model: GEMINI_EXPLAIN_MODEL,
+        contents: prompt,
+        config: {
+          ...explainJsonGenerationConfig,
+        },
+      })
+    );
+    const text = result.text?.trim() ?? "";
+    if (!text) return { ok: false, reason: "uncertain" };
+    const parsed = parseModelJson(text, minimalFixSchema);
+    if (parsed.result === "COMPLEX") return { ok: false, reason: "complex" };
+    if (parsed.result === "UNCERTAIN") return { ok: false, reason: "uncertain" };
+    if (!parsed.new_region?.trim()) return { ok: false, reason: "uncertain" };
+    return { ok: true, newRegion: parsed.new_region.replace(/\\n/g, "\n") };
+  } catch (e) {
+    logGeminiFailure("generateMinimalFix", e);
+    return { ok: false, reason: "error" };
   }
 }
 
@@ -305,7 +508,7 @@ export async function generateNarrative(
   reviewComments: Array<{ author: string; text: string }>,
   issues: Array<{ title: string; body: string }>
 ): Promise<Narrative> {
-  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
+  const ai = getGoogleGenAI();
 
   const contextData = [
     commitMessage && `Commit: ${commitMessage}`,
@@ -343,13 +546,14 @@ ${contextData}`;
 
   try {
     const result = await withGemini429Retry(() =>
-      model.generateContent({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
+      ai.models.generateContent({
+        model: GEMINI_GENERATION_MODEL,
+        contents: prompt,
+        config: structuredJsonGenerationConfig,
       })
     );
 
-    const responseText =
-      result.response.candidates?.[0]?.content?.parts?.[0]?.text;
+    const responseText = result.text;
 
     if (!responseText) {
       return {
@@ -368,87 +572,11 @@ ${contextData}`;
       };
     }
 
-    // Parse JSON from response - try multiple extraction methods
-    let jsonStr = responseText.trim();
-    
-    // Try markdown code block
-    let match = jsonStr.match(/```(?:json)?\n?([\s\S]*?)\n?```/);
-    if (match) {
-      jsonStr = match[1].trim();
-    } else {
-      // Try to find JSON object in response
-      const jsonStart = jsonStr.indexOf("{");
-      if (jsonStart !== -1) {
-        // Find the matching closing brace
-        let braceCount = 0;
-        let endIdx = jsonStart;
-        for (let i = jsonStart; i < jsonStr.length; i++) {
-          if (jsonStr[i] === "{") braceCount++;
-          if (jsonStr[i] === "}") braceCount--;
-          if (braceCount === 0) {
-            endIdx = i;
-            break;
-          }
-        }
-        if (endIdx > jsonStart) {
-          jsonStr = jsonStr.substring(jsonStart, endIdx + 1);
-        }
-      }
-    }
-
-    // Clean up: replace literal newlines inside strings with escaped versions
-    let i = 0;
-    let cleaned = "";
-    let inString = false;
-    let escapeNext = false;
-
-    for (i = 0; i < jsonStr.length; i++) {
-      const char = jsonStr[i];
-      const prevChar = i > 0 ? jsonStr[i - 1] : "";
-
-      if (escapeNext) {
-        cleaned += char;
-        escapeNext = false;
-        continue;
-      }
-
-      if (char === "\\") {
-        cleaned += char;
-        escapeNext = true;
-        continue;
-      }
-
-      if (char === '"' && prevChar !== "\\") {
-        inString = !inString;
-        cleaned += char;
-        continue;
-      }
-
-      if (inString && (char === "\n" || char === "\r")) {
-        // Inside a string, replace newlines with \n
-        if (char === "\r" && jsonStr[i + 1] === "\n") {
-          i++; // Skip the \n in \r\n
-        }
-        cleaned += "\\n";
-      } else {
-        cleaned += char;
-      }
-    }
-
-    jsonStr = cleaned;
-
-    const parsed = JSON.parse(jsonStr);
-    const validated = narrativeSchema.parse(parsed);
-
-    return validated;
+    return parseModelJson(responseText, narrativeSchema);
   } catch (error) {
-    console.error("Error generating narrative:", error);
-    if (error instanceof Error) {
-      console.error("Error message:", error.message);
-      console.error("Error stack:", error.stack);
-    }
+    logGeminiFailure("Error generating narrative", error);
     throw new Error(
-      `Failed to generate narrative from Gemini: ${error instanceof Error ? error.message : String(error)}`
+      `Failed to generate narrative from Gemini: ${safeErrText(error)}`
     );
   }
 }
@@ -491,8 +619,7 @@ export function matchAntiPattern(
 
 /**
  * Comma-separated in GEMINI_EMBEDDING_MODELS.
- * Default order: models that work with Generative Language API v1 + @google/generative-ai embedContent
- * (gemini-embedding-001 often 404s on v1 — see https://ai.google.dev/gemini-api/docs/embeddings).
+ * Default order for @google/genai embedContent (see https://ai.google.dev/gemini-api/docs/embeddings).
  */
 function embeddingModelCandidates(): string[] {
   const raw = process.env.GEMINI_EMBEDDING_MODELS?.trim();
@@ -520,36 +647,31 @@ export async function getEmbedding(
   if (!key) return null;
 
   const chunk = text.slice(0, 8000);
-  const taskType =
-    role === "query" ? TaskType.RETRIEVAL_QUERY : TaskType.RETRIEVAL_DOCUMENT;
+  const taskType = role === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT";
+  const ai = getGoogleGenAI();
 
   for (const modelName of embeddingModelCandidates()) {
     try {
-      const model = genAI.getGenerativeModel({ model: modelName });
-      const attempts: Array<() => Promise<{ embedding?: { values?: number[] } }>> = [
-        () => model.embedContent(chunk),
-        () =>
-          model.embedContent({
-            content: { role: "user", parts: [{ text: chunk }] },
-          }),
-        () =>
-          model.embedContent({
-            content: { role: "user", parts: [{ text: chunk }] },
-            taskType,
-          }),
-      ];
-      for (const run of attempts) {
-        try {
-          const res = await run();
-          const values = res?.embedding?.values;
-          if (Array.isArray(values) && values.length > 0) return values;
-        } catch (e) {
-          if (isGeminiRateLimitError(e)) throw e;
-        }
+      const config: {
+        taskType: string;
+        outputDimensionality?: number;
+      } = { taskType };
+      if (!/embedding-001$/i.test(modelName) && !modelName.includes("embedding-001")) {
+        config.outputDimensionality = 768;
       }
+      const res = await ai.models.embedContent({
+        model: modelName,
+        contents: chunk,
+        config,
+      });
+      const values = res.embeddings?.[0]?.values;
+      if (Array.isArray(values) && values.length > 0) return values;
     } catch (err) {
       if (isGeminiRateLimitError(err)) throw err;
-      console.warn(`getEmbedding model ${modelName} failed:`, err instanceof Error ? err.message : err);
+      console.warn(
+        `getEmbedding model ${modelName} failed:`,
+        err instanceof Error ? err.message : err
+      );
     }
   }
   return null;
@@ -563,7 +685,7 @@ export async function translateEnglishToHindiForSpeech(english: string): Promise
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new Error("GEMINI_API_KEY not configured");
 
-  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
+  const ai = getGoogleGenAI();
   const prompt = `You translate English into natural Hindi suitable for text-to-speech.
 
 Rules:
@@ -576,12 +698,13 @@ English to translate:
 ${english}`;
 
   const result = await withGemini429Retry(() =>
-    model.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
+    ai.models.generateContent({
+      model: GEMINI_GENERATION_MODEL,
+      contents: prompt,
     })
   );
 
-  const text = result.response.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  const text = result.text?.trim();
   if (!text) throw new Error("Empty Hindi translation from model");
   return text.length > 5000 ? `${text.slice(0, 4999)}…` : text;
 }
@@ -597,7 +720,7 @@ export async function voiceStoryAnswer(contextText: string, userQuestion: string
   const ctx = contextText.slice(0, 12_000);
   const q = userQuestion.trim().slice(0, 2000);
 
-  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
+  const ai = getGoogleGenAI();
   const prompt = `You are answering a developer who is asking by voice about a single line of code in a GitHub repository.
 
 The following text is the ONLY source of truth (from GitLore: blame, PRs, discussion, decision, impact). Do not invent commits, people, PR numbers, or events that are not clearly supported by this text.
@@ -621,12 +744,13 @@ STYLE (any language):
 Your reply:`;
 
   const result = await withGemini429Retry(() =>
-    model.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
+    ai.models.generateContent({
+      model: GEMINI_GENERATION_MODEL,
+      contents: prompt,
     })
   );
 
-  const text = result.response.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  const text = result.text?.trim();
   if (!text) throw new Error("Empty voice answer from model");
   return text.length > 4000 ? `${text.slice(0, 3999)}…` : text;
 }

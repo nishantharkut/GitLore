@@ -1,4 +1,4 @@
-import { MongoClient, Db, ObjectId } from "mongodb";
+import { MongoClient, Db, ObjectId, type Document } from "mongodb";
 
 let client: MongoClient | null = null;
 let db: Db | null = null;
@@ -88,6 +88,33 @@ async function createIndexes(database: Db) {
       .collection("knowledge_progress")
       .createIndex({ repo: 1 }, { unique: true });
 
+    await database
+      .collection("enforcement_logs")
+      .createIndex({ repo: 1, timestamp: -1 })
+      .catch((err) => {
+        const msg = err?.message || String(err);
+        if (!msg.includes("already exists")) {
+          console.warn(
+            "enforcement_logs repo/timestamp index:",
+            msg,
+            "(If keys changed, drop the conflicting index in Atlas/Shell and restart.)"
+          );
+        }
+      });
+    await database
+      .collection("enforcement_logs")
+      .createIndex({ user: 1, timestamp: -1 })
+      .catch((err) => {
+        const msg = err?.message || String(err);
+        if (!msg.includes("already exists")) {
+          console.warn(
+            "enforcement_logs user/timestamp index:",
+            msg,
+            "(If keys changed, drop the conflicting index in Atlas/Shell and restart.)"
+          );
+        }
+      });
+
     console.log("Database indexes created");
   } catch (error) {
     console.error("Error creating indexes:", error);
@@ -100,6 +127,18 @@ export function getDB(): Db {
     throw new Error("Database not connected. Call connectDB() first.");
   }
   return db;
+}
+
+/** Match first comment_patterns doc whose trigger_keywords intersect keyword list. */
+export async function findPattern(
+  keywords: string[]
+): Promise<Document | null> {
+  const normalized = keywords.map((k) => k.toLowerCase()).filter(Boolean);
+  if (!normalized.length) return null;
+  const database = getDB();
+  return database.collection("comment_patterns").findOne({
+    trigger_keywords: { $in: normalized },
+  });
 }
 
 export async function disconnectDB(): Promise<void> {

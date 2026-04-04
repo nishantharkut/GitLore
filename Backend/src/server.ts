@@ -17,6 +17,9 @@ import { testRouter } from "./routes/test";
 import { ingestRouter } from "./routes/ingest";
 import { chatRouter } from "./routes/chat";
 import { voiceRouter } from "./routes/voice";
+import { eventsRouter } from "./routes/events";
+import { enforcementRouter } from "./routes/enforcement";
+import { autofixRouter } from "./routes/autofix";
 
 /** Comma-separated in CORS_ORIGIN; first entry is default for non-browser clients. */
 function allowedCorsOrigins(): string[] {
@@ -60,6 +63,9 @@ app.route("/api", repoRouter);
 app.route("/api", ingestRouter);
 app.route("/api", chatRouter);
 app.route("/api", voiceRouter);
+app.route("/api", eventsRouter);
+app.route("/api", enforcementRouter);
+app.route("/api", autofixRouter);
 
 app.notFound((c) => {
   return c.json({ error: "Not found" }, 404);
