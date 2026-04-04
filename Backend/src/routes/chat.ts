@@ -3,13 +3,28 @@ import { z } from "zod";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { getDB } from "../lib/mongo";
 import { getCurrentUser } from "../middleware/auth";
-import { getEmbedding } from "../lib/gemini";
+import {
+  getEmbedding,
+  GEMINI_GENERATION_MODEL,
+  isGeminiApiKeyError,
+  isGeminiRateLimitError,
+  withGemini429Retry,
+} from "../lib/gemini";
 import { cosineSimilarity } from "../lib/vectorUtils";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
-/** Model for knowledge-graph Q&A (override via GEMINI_CHAT_MODEL). */
-const GEMINI_CHAT_MODEL = process.env.GEMINI_CHAT_MODEL?.trim() || "gemini-2.5-flash";
+/** Model for knowledge-graph Q&A (override via GEMINI_CHAT_MODEL; else GEMINI_GENERATION_MODEL / default). */
+const GEMINI_CHAT_MODEL =
+  process.env.GEMINI_CHAT_MODEL?.trim() || GEMINI_GENERATION_MODEL;
+
+function parseCommaModels(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
+}
+
+/** Tried in order after the primary chat model when that model returns 429 (separate free-tier quotas). */
+const DEFAULT_CHAT_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash"];
 
 export const chatRouter = new Hono();
 
@@ -72,6 +87,14 @@ function dedupeByPr(nodes: ScoredNode[]): ScoredNode[] {
   return [...best.values()].sort((a, b) => b.score - a.score);
 }
 
+const QUOTE_MAX = 450;
+
+function truncQuote(s: string, max: number): string {
+  const t = (s || "").replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max - 1)}…`;
+}
+
 function buildContextBlock(n: Record<string, unknown>): string {
   const quotes = (n.key_quotes as Array<{ author: string; text: string }>) || [];
   const alts = (n.alternatives as string[]) || [];
@@ -86,12 +109,20 @@ function buildContextBlock(n: Record<string, unknown>): string {
   const mergeLine = mc?.url
     ? `Merge commit: ${mc.short || ""} → ${mc.url}`
     : "(merge commit not stored for this PR — re-run ingest to link commits)";
-  const narrative = String(n.full_narrative || "").slice(0, 1500);
+  const narrative = String(n.full_narrative || "").slice(0, 3200);
   const topics = (n.topics as string[]) || [];
   const topicLine = topics.length ? topics.join(", ") : "(none)";
+  const prUrl = String(n.pr_url || "");
+  const quoteBlock =
+    quotes.length > 0
+      ? quotes
+          .map((q) => `  - ${q.author || "unknown"}: "${truncQuote(q.text, QUOTE_MAX)}"`)
+          .join("\n")
+      : "  (none)";
   return `--- Knowledge Node (PR #${n.pr_number}, type: ${n.type}) ---
+PR URL: ${prUrl || "(unknown)"}
 Title: ${n.title}
-Author: ${n.pr_author || "unknown"}
+GitHub author (merge): ${n.pr_author || "unknown"}
 Topics: ${topicLine}
 Summary: ${n.summary}
 Problem: ${n.problem}
@@ -99,13 +130,13 @@ Decision: ${n.decision}
 Linked issues (from GitHub GraphQL):
 ${linkedLines}
 ${mergeLine}
-Alternatives considered: ${alts.length ? alts.join(", ") : "(none)"}
-Key quotes:
-${quotes.length ? quotes.map((q) => `  - ${q.author}: "${q.text}"`).join("\n") : "  (none)"}
+Alternatives considered: ${alts.length ? alts.join("; ") : "(none)"}
+Key quotes (exact text from reviews/discussion — use verbatim when citing):
+${quoteBlock}
 Impact: ${n.impact}
 Files changed: ${files.join(", ") || "unknown"}
-Merged: ${n.merged_at || "unknown"}
-Full narrative (excerpt): ${narrative || "(none)"}
+Merged at: ${n.merged_at || "unknown"}
+Consolidated narrative (excerpt): ${narrative || "(none)"}
 ---`;
 }
 
@@ -122,7 +153,7 @@ async function tryVectorSearchAtlas(
         path: "embedding",
         queryVector,
         numCandidates: 100,
-        limit: 10,
+        limit: 16,
         filter: { repo: repoFull },
       },
     },
@@ -209,7 +240,7 @@ async function tryInMemoryVector(
       scored.push({ doc: rest as Record<string, unknown>, score });
     }
   }
-  return scored.sort((a, b) => b.score - a.score).slice(0, 10);
+  return scored.sort((a, b) => b.score - a.score).slice(0, 16);
 }
 
 async function tryTextSearch(
@@ -223,7 +254,7 @@ async function tryTextSearch(
       .find({ repo: repoFull, $text: { $search: question } })
       .project({ score: { $meta: "textScore" }, embedding: 0 })
       .sort({ score: { $meta: "textScore" } })
-      .limit(8)
+      .limit(14)
       .toArray();
     return arr
       .map((doc: any) => {
@@ -240,11 +271,13 @@ async function tryTextSearch(
 }
 
 function keywordsFromQuestion(q: string): string[] {
-  return q
+  const handles = [...q.matchAll(/@([\w-]{2,39})/g)].map((m) => m[1].toLowerCase());
+  const words = q
     .split(/\s+/)
     .map((w) => w.replace(/[^\w-]/g, "").toLowerCase())
-    .filter((w) => w.length >= 3 && !STOP.has(w))
-    .slice(0, 5);
+    .filter((w) => w.length >= 3 && !STOP.has(w));
+  const merged = [...handles, ...words];
+  return [...new Set(merged)].slice(0, 12);
 }
 
 async function tryRegexFallback(
@@ -259,24 +292,49 @@ async function tryRegexFallback(
     .collection("knowledge_nodes")
     .find({ repo: repoFull })
     .project({ embedding: 0 })
-    .limit(250)
+    .limit(400)
     .toArray();
 
   const scored: ScoredNode[] = [];
-  const fields = ["title", "summary", "decision", "problem", "full_narrative"] as const;
+  const fields = [
+    "title",
+    "summary",
+    "decision",
+    "problem",
+    "full_narrative",
+    "pr_author",
+    "impact",
+  ] as const;
 
   const linkedText = (doc: Record<string, unknown>) => {
     const arr = (doc.linked_issues as Array<{ title?: string; number?: number }>) || [];
     return arr.map((i) => `${i.number} ${i.title || ""}`).join(" ");
   };
 
+  const quotesText = (doc: Record<string, unknown>) => {
+    const arr = (doc.key_quotes as Array<{ author?: string; text?: string }>) || [];
+    return arr.map((q) => `${q.author || ""} ${q.text || ""}`).join(" ");
+  };
+
+  const topicsText = (doc: Record<string, unknown>) =>
+    ((doc.topics as string[]) || []).join(" ");
+  const filesText = (doc: Record<string, unknown>) =>
+    ((doc.changed_files as string[]) || []).join(" ");
+  const altsText = (doc: Record<string, unknown>) =>
+    ((doc.alternatives as string[]) || []).join(" ");
+
   for (const doc of docs) {
     let matches = 0;
     for (const kw of keywords) {
       const re = new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      const d = doc as Record<string, unknown>;
       if (
-        fields.some((f) => re.test(String((doc as Record<string, unknown>)[f] || ""))) ||
-        re.test(linkedText(doc as Record<string, unknown>))
+        fields.some((f) => re.test(String(d[f] || ""))) ||
+        re.test(linkedText(d)) ||
+        re.test(quotesText(d)) ||
+        re.test(topicsText(d)) ||
+        re.test(filesText(d)) ||
+        re.test(altsText(d))
       ) {
         matches++;
       }
@@ -287,7 +345,7 @@ async function tryRegexFallback(
     }
   }
 
-  return scored.sort((a, b) => b.score - a.score).slice(0, 8);
+  return scored.sort((a, b) => b.score - a.score).slice(0, 14);
 }
 
 chatRouter.post("/repo/:owner/:name/chat", async (c) => {
@@ -378,41 +436,75 @@ chatRouter.post("/repo/:owner/:name/chat", async (c) => {
     }
 
     const nodesSearched = scored.length;
-    const deduped = dedupeByPr(scored).slice(0, 10);
+    let usedNodes = dedupeByPr(scored).slice(0, 14);
 
-    let contextParts = deduped.map((x) => buildContextBlock(x.doc));
-    let context = contextParts.join("\n\n");
-    if (context.length > 22000) {
-      contextParts = contextParts.slice(0, 7);
-      context = contextParts.join("\n\n");
+    const CONTEXT_CHAR_CAP = 34000;
+    const buildContext = (nodes: ScoredNode[]) => {
+      const parts = nodes.map((x) => buildContextBlock(x.doc));
+      return { parts, text: parts.join("\n\n") };
+    };
+    let { parts: contextParts, text: context } = buildContext(usedNodes);
+    if (context.length > CONTEXT_CHAR_CAP) {
+      usedNodes = usedNodes.slice(0, 10);
+      ({ text: context } = buildContext(usedNodes));
+    }
+    if (context.length > CONTEXT_CHAR_CAP) {
+      usedNodes = usedNodes.slice(0, 7);
+      ({ text: context } = buildContext(usedNodes));
     }
 
-    const systemPreamble = `You are GitLore, a knowledge graph assistant for the repository ${repoFull}.
-You answer questions about engineering decisions, architecture, PR history, linked issues, and contributors using ONLY the knowledge nodes provided below.
+    const systemPreamble = `You are GitLore, a senior staff engineer explaining this repository's history to a teammate. You write from the knowledge nodes only—no speculation, no outside knowledge.
 
-Rules:
-1. ONLY use information from the provided knowledge nodes. Never invent PR numbers, issues, or quotes.
-2. Always cite specific PR numbers (e.g. "In PR #42…"). When linked issues are listed for a PR, mention them by issue number.
-3. Use exact wording from key_quotes when citing discussion; attribute the author.
-4. If the nodes do not contain enough information, say what is missing and which PRs came closest.
-5. For broad questions ("what changed in the API?"), synthesize across multiple PRs and compare timelines using merged dates when helpful.
-6. Mention change type (feature/bugfix/refactor/etc.) and author when it clarifies the story.
-7. Prefer accuracy and depth over brevity: use several short paragraphs when the user asks for history or "everything relevant".`;
+Voice and quality:
+- Write polished, readable prose: varied sentence length, smooth transitions ("Separately…", "Earlier…", "In the same area…"), and one main idea per paragraph.
+- Open with a short, direct takeaway (2–4 sentences) that answers the question. Then add depth: context, tradeoffs, who was involved, and how PRs relate.
+- Prefer concrete nouns and verbs from the nodes over vague phrases like "the team improved things." Tie claims to PR numbers, issue numbers, file paths, or quotes.
+- When several PRs matter, organize logically (e.g. by theme or by merged_at order) and make the thread easy to follow.
+- Do not pad with generic disclaimers. If evidence is thin, say exactly what the nodes show and what they omit, in one clear sentence.
 
-    const userMsg = `Knowledge nodes:\n${context}\n\nUser question:\n${question}`;
+Grounding (non-negotiable):
+- Use ONLY facts in the nodes (title, summary, problem, decision, impact, alternatives, key_quotes, linked_issues, merge_commit, topics, full_narrative excerpt, pr_author, merged_at, type, changed_files). If the answer is not in the graph, say so and point to the closest PRs by title/summary.
+- Never invent PR numbers, issues, URLs, dates, or quotes. When you quote discussion, use the exact wording from key_quotes and attribute the author from the node.
+- "GitHub author (merge)" is the merger/author on the PR; reviewers in key_quotes may differ—state that distinction when it matters.
 
-    const model = genAI.getGenerativeModel({
-      model: GEMINI_CHAT_MODEL,
-      systemInstruction: systemPreamble,
-    } as Parameters<typeof genAI.getGenerativeModel>[0]);
+By question type:
+- Why / tradeoffs: problem → alternatives → decision → impact; fold in quotes where they illuminate disagreement or consensus.
+- What changed: summarize the change, mention type (feature/bugfix/refactor…), files or areas if listed, and outcomes from impact.
+- Who: only people named as pr_author or in key_quotes (or clearly in node text). Otherwise say the graph does not name them.
+- When / order: use merged_at to sequence; do not infer dates beyond what is given.
+- Issues: report linked_issues and merge_commit as stored; if missing, say ingest may need a refresh.
+
+Formatting:
+- Plain paragraphs. Use bullet lists only if the user asks for a list or many parallel items would be clearer that way.
+- Naturally weave in PR references (e.g. "In PR #42, …").`;
+
+    const userMsg = `Below are knowledge nodes retrieved for this question. Read them carefully, then answer.
+
+Knowledge nodes:
+${context}
+
+User question:
+${question}
+
+Instructions: Answer using only the nodes above. Be specific and well structured. If the question is narrow, stay focused; if it is broad, synthesize without losing accuracy.`;
+
+    const configuredFallbacks = parseCommaModels(process.env.GEMINI_CHAT_MODEL_FALLBACKS);
+    const chatFallbacks = configuredFallbacks.length
+      ? configuredFallbacks
+      : DEFAULT_CHAT_MODEL_FALLBACKS;
+    const chatModelChain = [
+      GEMINI_CHAT_MODEL,
+      ...chatFallbacks.filter((m) => m !== GEMINI_CHAT_MODEL),
+    ];
 
     let answer: string;
     let synthesis: ChatSynthesis = "none";
+    let modelForResponse = GEMINI_CHAT_MODEL;
     if (!geminiConfigured) {
       synthesis = "fallback_no_key";
       answer =
         "GEMINI_API_KEY is not set in the GitLore **Backend** environment, so answers are not synthesized by Gemini. Add `GEMINI_API_KEY` to `GitLore/Backend/.env`, restart the API server, then ask again.\n\nClosest matching PR decisions from the index:\n\n" +
-        deduped
+        usedNodes
           .map(
             (x) =>
               `• PR #${x.doc.pr_number} [${x.doc.type}]: ${x.doc.title}\n  ${String(x.doc.summary).slice(0, 280)}${String(x.doc.summary).length > 280 ? "…" : ""}`
@@ -420,24 +512,71 @@ Rules:
           .join("\n\n");
     } else {
       try {
-        const result = await model.generateContent({
-          contents: [{ role: "user", parts: [{ text: userMsg }] }],
-          generationConfig: {
-            maxOutputTokens: 2048,
-            temperature: 0.3,
-            topP: 0.9,
-          },
-        });
-        answer =
-          result.response.candidates?.[0]?.content?.parts?.[0]?.text ||
-          "Unable to generate a synthesized answer.";
+        let lastErr: unknown;
+        let geminiResult: { text: string; model: string } | null = null;
+        for (let i = 0; i < chatModelChain.length; i++) {
+          const modelName = chatModelChain[i];
+          const isLast = i === chatModelChain.length - 1;
+          try {
+            const mdl = genAI.getGenerativeModel({
+              model: modelName,
+              systemInstruction: systemPreamble,
+            } as Parameters<typeof genAI.getGenerativeModel>[0]);
+            const run = () =>
+              mdl.generateContent({
+                contents: [{ role: "user", parts: [{ text: userMsg }] }],
+                generationConfig: {
+                  maxOutputTokens: 4096,
+                  temperature: 0.42,
+                  topP: 0.92,
+                  topK: 40,
+                },
+              });
+            const result = isLast
+              ? await withGemini429Retry(run, { maxRetries: 2 })
+              : await run();
+            const text =
+              result.response.candidates?.[0]?.content?.parts?.[0]?.text ||
+              "Unable to generate a synthesized answer.";
+            geminiResult = { text, model: modelName };
+            break;
+          } catch (e) {
+            lastErr = e;
+            if (isGeminiRateLimitError(e) && !isLast) {
+              console.warn(
+                `[chat] Model ${modelName} rate limited; trying ${chatModelChain[i + 1]}…`
+              );
+              continue;
+            }
+            throw e;
+          }
+        }
+        if (!geminiResult) {
+          throw lastErr instanceof Error
+            ? lastErr
+            : new Error("Gemini chat: no model succeeded");
+        }
+        answer = geminiResult.text;
         synthesis = "gemini";
+        modelForResponse = geminiResult.model;
       } catch (err) {
         console.error("Gemini chat synthesis error:", err);
         synthesis = "fallback_error";
+        const rateLimited = isGeminiRateLimitError(err);
+        const keyInvalid = isGeminiApiKeyError(err);
+        const quotaNote = rateLimited
+          ? "Google returned HTTP 429 (rate limit or free-tier quota). Wait about a minute and try again, or review billing and limits: https://ai.google.dev/gemini-api/docs/rate-limits\n\n"
+          : "";
+        const keyNote = keyInvalid
+          ? "Your Gemini API key was rejected (expired, revoked, or invalid). Create a new key in Google AI Studio (https://aistudio.google.com/apikey), set GEMINI_API_KEY in GitLore/Backend/.env, and restart the backend. Retrying will not help until the key is updated.\n\n"
+          : "";
         answer =
-          "Gemini synthesis failed (check API key, quota, and model name). Showing raw matches from the graph:\n\n" +
-          deduped
+          (keyInvalid
+            ? "Gemini could not run because the API key is not valid.\n\n"
+            : "Gemini synthesis failed (check API key, quota, and model name). Showing raw matches from the graph:\n\n") +
+          keyNote +
+          quotaNote +
+          usedNodes
             .map(
               (x) =>
                 `• PR #${x.doc.pr_number}: ${x.doc.title} — ${String(x.doc.summary).slice(0, 200)}…`
@@ -448,7 +587,7 @@ Rules:
 
     answer = answer + ingestNote;
 
-    const sources = deduped.map((x) => ({
+    const sources = usedNodes.map((x) => ({
       pr_number: x.doc.pr_number as number,
       pr_url: String(x.doc.pr_url || ""),
       title: String(x.doc.title || ""),
@@ -461,10 +600,10 @@ Rules:
       sources,
       searchTier: tier,
       nodesSearched,
-      nodesUsed: deduped.length,
+      nodesUsed: usedNodes.length,
       geminiConfigured,
       synthesis,
-      model: GEMINI_CHAT_MODEL,
+      model: modelForResponse,
     });
   } catch (error) {
     console.error("Chat error:", error);

@@ -97,7 +97,7 @@ export function ChatPanel() {
       if (typeof res.geminiConfigured === "boolean") {
         setChatStatus((prev) => ({
           geminiConfigured: res.geminiConfigured!,
-          model: res.model || prev?.model || "gemini-2.5-flash",
+          model: res.model || prev?.model || "gemini-2.5-flash-lite",
         }));
       }
       setMessages((prev) => [

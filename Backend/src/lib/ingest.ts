@@ -1,6 +1,10 @@
 import { createGithubClient } from "./github";
 import { getDB } from "./mongo";
-import { getEmbedding } from "./gemini";
+import {
+  getEmbedding,
+  GEMINI_GENERATION_MODEL,
+  withGemini429Retry,
+} from "./gemini";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 
@@ -175,7 +179,7 @@ function cleanJsonString(jsonStr: string): string {
 }
 
 export async function extractKnowledge(pr: any): Promise<KnowledgeNode> {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
 
   const reviewNodes = (pr.reviews?.nodes || []).filter((r: any) => r.body?.trim()).slice(0, 10);
   const reviews = reviewNodes
@@ -272,26 +276,6 @@ Rules:
   return knowledgeNodeSchema.parse(parsed);
 }
 
-function isRateLimitError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (/429|rate\s*limit|resource_exhausted|too many requests/i.test(msg)) return true;
-  const code = (err as { status?: number; code?: number })?.status ?? (err as { code?: number })?.code;
-  return code === 429;
-}
-
-/** KNOWLEDGE_GRAPH_FOLLOWUP.md §3.2: wait 10s and retry once on Gemini 429. */
-async function withGemini429Retry<T>(fn: () => Promise<T>): Promise<T> {
-  try {
-    return await fn();
-  } catch (e) {
-    if (isRateLimitError(e)) {
-      await new Promise((r) => setTimeout(r, 10_000));
-      return await fn();
-    }
-    throw e;
-  }
-}
-
 export interface IngestProgress {
   status: "running" | "done" | "error";
   processed: number;
@@ -356,7 +340,9 @@ export async function ingestRepo(
 
       const results = await Promise.allSettled(
         batch.map(async (pr) => {
-          const knowledge = await withGemini429Retry(() => extractKnowledge(pr));
+          const knowledge = await withGemini429Retry(() => extractKnowledge(pr), {
+            maxRetries: 1,
+          });
           const topics = (knowledge.topics || []).join(", ");
           const embeddingText =
             `${knowledge.title}. ${knowledge.summary}. ${knowledge.decision}. Topics: ${topics}`.trim();

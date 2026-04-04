@@ -4,6 +4,88 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
+/**
+ * Text generation (PR knowledge extraction, narratives, review explanations).
+ * Chat uses GEMINI_CHAT_MODEL if set, otherwise this default.
+ * Default: gemini-2.5-flash-lite (cost-efficient; free tier with its own quotas).
+ * gemini-2.0-flash is deprecated — override with GEMINI_GENERATION_MODEL if needed.
+ */
+export const GEMINI_GENERATION_MODEL =
+  process.env.GEMINI_GENERATION_MODEL?.trim() || "gemini-2.5-flash-lite";
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** True for HTTP 429 / RESOURCE_EXHAUSTED-style Gemini errors. */
+export function isGeminiRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    /429|rate\s*limit|resource_exhausted|too many requests|quota exceeded/i.test(
+      msg
+    )
+  ) {
+    return true;
+  }
+  const status = (err as { status?: number })?.status;
+  const code = (err as { code?: number })?.code;
+  return status === 429 || code === 429;
+}
+
+/** Expired, revoked, or malformed API key (retries will not help). */
+export function isGeminiApiKeyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/API_KEY_INVALID|API key expired|invalid api key|API key not valid/i.test(msg)) {
+    return true;
+  }
+  if (/\[400\b[^\]]*Bad Request\]/i.test(msg) && /api key/i.test(msg)) {
+    return true;
+  }
+  const status = (err as { status?: number })?.status;
+  return status === 400 && /api key|API_KEY/i.test(msg);
+}
+
+/** Parse `Please retry in 14.9s` from Gemini error text when present. */
+export function geminiSuggestedRetryMs(err: unknown): number | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = msg.match(/retry in ([\d.]+)\s*s\b/i);
+  if (!m) return null;
+  const sec = parseFloat(m[1]);
+  if (!Number.isFinite(sec) || sec < 0) return null;
+  return Math.min(Math.ceil(sec * 1000) + 500, 120_000);
+}
+
+export type Gemini429RetryOptions = {
+  /** Extra attempts after the first failure (default 3 → 4 total calls). */
+  maxRetries?: number;
+};
+
+/**
+ * Retries generateContent-style calls when the API returns 429. Uses server
+ * suggested delay when present (see terminal: "Please retry in 14.9s").
+ */
+export async function withGemini429Retry<T>(
+  fn: () => Promise<T>,
+  opts?: Gemini429RetryOptions
+): Promise<T> {
+  const maxRetries = opts?.maxRetries ?? 3;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (!isGeminiRateLimitError(e) || attempt >= maxRetries) throw e;
+      const suggested = geminiSuggestedRetryMs(e);
+      const delay =
+        suggested ?? Math.min(12_000 + attempt * 8_000, 90_000);
+      console.warn(
+        `[Gemini] Rate limited (${attempt + 1}/${maxRetries + 1}), waiting ${Math.round(delay / 1000)}s…`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
 // Schema for explanation responses
 export const explanationSchema = z.object({
   pattern_name: z.string(),
@@ -64,7 +146,7 @@ export async function explainComment(
   filePath: string,
   context: string
 ): Promise<Explanation> {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
 
   const prompt = `Respond ONLY with valid JSON (no other text).
 
@@ -205,7 +287,7 @@ export async function generateNarrative(
   reviewComments: Array<{ author: string; text: string }>,
   issues: Array<{ title: string; body: string }>
 ): Promise<Narrative> {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
 
   const contextData = [
     commitMessage && `Commit: ${commitMessage}`,
@@ -387,7 +469,11 @@ export function matchAntiPattern(
   return null;
 }
 
-/** Comma-separated in GEMINI_EMBEDDING_MODELS; default matches KNOWLEDGE_GRAPH docs (gemini-embedding-001). */
+/**
+ * Comma-separated in GEMINI_EMBEDDING_MODELS.
+ * Default order: models that work with Generative Language API v1 + @google/generative-ai embedContent
+ * (gemini-embedding-001 often 404s on v1 — see https://ai.google.dev/gemini-api/docs/embeddings).
+ */
 function embeddingModelCandidates(): string[] {
   const raw = process.env.GEMINI_EMBEDDING_MODELS?.trim();
   if (raw) {
@@ -397,7 +483,7 @@ function embeddingModelCandidates(): string[] {
       .filter(Boolean);
     if (list.length) return list;
   }
-  return ["gemini-embedding-001"];
+  return ["text-embedding-004", "embedding-001", "gemini-embedding-001"];
 }
 
 export type EmbeddingRole = "query" | "document";
@@ -420,20 +506,27 @@ export async function getEmbedding(
   for (const modelName of embeddingModelCandidates()) {
     try {
       const model = genAI.getGenerativeModel({ model: modelName });
-      let res: { embedding?: { values?: number[] } };
-      try {
-        res = await model.embedContent({
-          content: { role: "user", parts: [{ text: chunk }] },
-          taskType,
-        });
-      } catch {
-        res = await model.embedContent({
-          content: { role: "user", parts: [{ text: chunk }] },
-          taskType,
-        });
+      const attempts: Array<() => Promise<{ embedding?: { values?: number[] } }>> = [
+        () => model.embedContent(chunk),
+        () =>
+          model.embedContent({
+            content: { role: "user", parts: [{ text: chunk }] },
+          }),
+        () =>
+          model.embedContent({
+            content: { role: "user", parts: [{ text: chunk }] },
+            taskType,
+          }),
+      ];
+      for (const run of attempts) {
+        try {
+          const res = await run();
+          const values = res?.embedding?.values;
+          if (Array.isArray(values) && values.length > 0) return values;
+        } catch {
+          /* try next shape */
+        }
       }
-      const values = res?.embedding?.values;
-      if (Array.isArray(values) && values.length > 0) return values;
     } catch (err) {
       console.warn(`getEmbedding model ${modelName} failed:`, err instanceof Error ? err.message : err);
     }

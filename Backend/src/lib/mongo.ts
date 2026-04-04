@@ -58,6 +58,7 @@ async function createIndexes(database: Db) {
           decision: "text",
           full_narrative: "text",
           topics: "text",
+          pr_author: "text",
         },
         { name: "knowledge_text_search" }
       )
