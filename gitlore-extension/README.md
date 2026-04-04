@@ -4,13 +4,13 @@
 
 If you run the **GitLore backend** locally or remotely:
 
-1. In extension **Settings**, set **GitLore backend URL** (e.g. `http://localhost:3001`).
+1. In extension **Settings**, set **GitLore backend URL** (e.g. `http://localhost:3001`) and **Save**. For `localhost` / `127.0.0.1`, Chrome asks for **optional** access to those origins — approve it so ingest/chat can reach your API. After an extension update, **Save settings** (or **Index current GitHub tab**) again if local calls fail until permission is granted.
 2. In `GitLore/Backend/.env`, set **`CHROME_EXTENSION_CORS_ORIGINS=chrome-extension://YOUR_EXTENSION_ID`** (from `chrome://extensions` → Details).
 3. **Connect with GitHub** (device flow). The extension calls **`POST /auth/github/exchange-token`** to obtain the same signed session as the web app.
 4. Open a **`github.com/owner/repo`** tab, open the popup, click **Index current GitHub tab → backend**. That starts **`POST /api/repo/:owner/:name/ingest`** (merged PRs → Mongo knowledge graph).
 5. Open the **side panel**: chat uses **`POST /api/repo/:owner/:name/chat`** (server-side Gemini + graph), like the website.
 
-For a **remote** HTTPS API, add that origin to `manifest.json` `host_permissions` (or use `optional_host_permissions` + runtime request).
+For a **remote** HTTPS API, add that origin to `manifest.json` `host_permissions` (or `optional_host_permissions` + a runtime `chrome.permissions.request` in the popup, same pattern as localhost).
 
 ## Standalone mode (no backend)
 
@@ -59,6 +59,7 @@ Optional if you use **standalone** mode. **Platform** mode uses the server’s `
 - `https://api.github.com/*` — repos, git trees, README.
 - `https://github.com/*` — device OAuth (`/login/device/code`, `/login/oauth/access_token`, user flow), and the **floating launcher** content script (no blanket `https://*/*` host access).
 - `https://generativelanguage.googleapis.com/*` — Gemini streaming.
+- **`http://localhost/*` and `http://127.0.0.1/*`** — **optional** host permissions; granted when you **Save** a local backend URL or use **Index current GitHub tab** (keeps the default install footprint smaller for store review).
 - `tabs` — open GitHub device page, notify tabs when sign-in state changes for the float button.
 
 ## Vendored assets

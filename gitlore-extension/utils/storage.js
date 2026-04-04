@@ -120,9 +120,6 @@ export async function setGithubUser(user) {
 }
 
 /**
- * @returns {Promise<void>}
- */
-/**
  * @returns {Promise<string | null>}
  */
 export async function getGitloreSession() {
@@ -143,6 +140,10 @@ export async function setGitloreSession(token) {
   await chrome.storage.local.set({ [STORAGE_KEYS.GITLORE_SESSION]: token });
 }
 
+/**
+ * Clears GitHub token, profile, and GitLore server session.
+ * @returns {Promise<void>}
+ */
 export async function clearSession() {
   await chrome.storage.local.remove([
     STORAGE_KEYS.GITHUB_TOKEN,

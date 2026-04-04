@@ -49,6 +49,10 @@ body {
   overflow: hidden;
 }
 
+.hidden {
+  display: none !important;
+}
+
 .topbar {
   display: flex;
   flex-direction: column;

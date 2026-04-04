@@ -32,6 +32,7 @@ const copyDeviceCodeBtn = $("copyDeviceCodeBtn");
 /** @type {string} */
 let lastShownDeviceUserCode = "";
 const saveSettings = $("saveSettings");
+const settingsError = $("settingsError");
 const loginError = $("loginError");
 const setupHint = $("setupHint");
 const openGithubOAuthApps = $("openGithubOAuthApps");
@@ -96,12 +97,33 @@ function broadcastGitloreSessionToTabs() {
 }
 
 function showError(el, msg) {
+  if (!el) return;
   el.textContent = msg;
   el.classList.remove("hidden");
 }
 
 function hideError(el) {
-  el.classList.add("hidden");
+  if (el) el.classList.add("hidden");
+}
+
+/**
+ * Optional host access for local GitLore API (narrower than always-on localhost in manifest).
+ * @param {string} backendUrl
+ * @returns {Promise<boolean>} false if user denied or URL is invalid for localhost check
+ */
+async function ensureLocalhostBackendPermission(backendUrl) {
+  const t = (backendUrl || "").trim();
+  if (!t) return true;
+  let hostname = "";
+  try {
+    hostname = new URL(t).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
+  if (hostname !== "localhost" && hostname !== "127.0.0.1") return true;
+  return chrome.permissions.request({
+    origins: ["http://localhost/*", "http://127.0.0.1/*"],
+  });
 }
 
 function formatDate(iso) {
@@ -412,6 +434,17 @@ toggleSettingsHeader?.addEventListener("click", toggleSettingsPanel);
 
 saveSettings.addEventListener("click", async () => {
   const backend = gitloreBackendUrl ? gitloreBackendUrl.value.trim() : "";
+  hideError(settingsError);
+  if (backend) {
+    const ok = await ensureLocalhostBackendPermission(backend);
+    if (!ok) {
+      showError(
+        settingsError,
+        "Chrome did not allow access to localhost. Approve the permission, then Save again."
+      );
+      return;
+    }
+  }
   await storage.saveSettings({
     githubOauthClientId: githubOauthClientId.value.trim(),
     githubOauthClientSecret: githubOauthClientSecret
@@ -463,6 +496,18 @@ indexCurrentTabBtn?.addEventListener("click", () => {
       return;
     }
     try {
+      const s = await storage.getSettings();
+      const backend = (s.gitloreBackendUrl || "").trim();
+      if (backend) {
+        const ok = await ensureLocalhostBackendPermission(backend);
+        if (!ok) {
+          showError(
+            repoError,
+            "Allow localhost access when Chrome prompts, then try Index again (or Save settings once)."
+          );
+          return;
+        }
+      }
       await githubApi.platformStartRepo({
         owner: parsed.owner,
         name: parsed.name,

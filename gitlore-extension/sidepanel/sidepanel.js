@@ -240,9 +240,13 @@ async function pollPlatformIngestOnce() {
   }
 }
 
-function startPlatformIngestPolling() {
+function stopPlatformIngestPolling() {
   if (ingestPollTimer) clearInterval(ingestPollTimer);
   ingestPollTimer = null;
+}
+
+function startPlatformIngestPolling() {
+  stopPlatformIngestPolling();
   if (!platformMode || !ctx) return;
   ingestPollTimer = setInterval(() => void pollPlatformIngestOnce(), 5000);
   void pollPlatformIngestOnce();
@@ -286,13 +290,22 @@ function applyGeminiKeyUi(hasGemini) {
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.gitloreSettings) return;
-  (async () => {
+  if (area !== "local") return;
+  const sk = storage.STORAGE_KEYS;
+  if (!changes[sk.SETTINGS] && !changes[sk.GITLORE_SESSION]) return;
+  void (async () => {
     const s = await storage.getSettings();
     const sess = await githubApi.getSession();
     const plat = !!(s.gitloreBackendUrl || "").trim() && !!sess.gitloreSession;
-    if (plat) applyPlatformChatUi();
-    else applyGeminiKeyUi(!!(s.geminiApiKey || "").trim());
+    platformMode = plat;
+    if (plat) {
+      applyPlatformChatUi();
+      if (ctx) startPlatformIngestPolling();
+    } else {
+      stopPlatformIngestPolling();
+      applyGeminiKeyUi(!!(s.geminiApiKey || "").trim());
+      if (!ctx) btnRefreshIngest?.classList.add("hidden");
+    }
   })();
 });
 

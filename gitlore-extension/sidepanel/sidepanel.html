@@ -24,7 +24,14 @@
       <div class="topbar-toolbar">
         <div class="topbar-buttons">
           <button type="button" id="btnRepoPicker" class="btn btn-sm">Switch repo</button>
-          <button type="button" id="btnOpenGraph" class="btn btn-sm">Knowledge graph</button>
+          <button
+            type="button"
+            id="btnRefreshIngest"
+            class="btn btn-sm hidden"
+            title="Refresh ingest status from the GitLore server"
+          >
+            Refresh ingest
+          </button>
         </div>
         <div id="analyzeStatus" class="analyze-status" aria-live="polite"></div>
       </div>
