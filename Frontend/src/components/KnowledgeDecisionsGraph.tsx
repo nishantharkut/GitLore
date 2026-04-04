@@ -366,19 +366,17 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
         : null;
     if (cached?.nodes?.length) {
       knowledgeLayoutCache.set(key, cached);
+      setLayout(cached);
     }
 
     let cancelled = false;
-
-    if (cached?.nodes?.length) {
-      setLayout(cached);
-      setErr(null);
+    const hasInstantLayout = !!(cached?.nodes?.length);
+    if (!hasInstantLayout) {
       setLoading(true);
     } else {
-      setLayout(null);
-      setLoading(true);
-      setErr(null);
+      setLoading(false);
     }
+    setErr(null);
 
     void fetchKnowledgeLayout(owner, name)
       .then((res) => {
