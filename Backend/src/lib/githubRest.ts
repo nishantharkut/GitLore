@@ -110,6 +110,26 @@ export async function listPullRequestReviewCommentsRest(
   );
 }
 
+export type PullRequestFileRest = {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  changes: number;
+};
+
+export async function listPullRequestFilesRest(
+  token: string,
+  owner: string,
+  repo: string,
+  pullNumber: number
+): Promise<PullRequestFileRest[]> {
+  return githubRestJson<PullRequestFileRest[]>(
+    token,
+    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pullNumber}/files?per_page=100`
+  );
+}
+
 export async function getPullRequestDiffRest(
   token: string,
   owner: string,
@@ -123,6 +143,11 @@ export async function getPullRequestDiffRest(
   );
 }
 
+export type PullRequestRefRest = {
+  ref: string;
+  sha: string;
+};
+
 export type PullRequestDetailRest = {
   number: number;
   title: string;
@@ -130,6 +155,8 @@ export type PullRequestDetailRest = {
   user: { login: string } | null;
   updated_at: string;
   html_url: string;
+  head: PullRequestRefRest;
+  base: PullRequestRefRest;
 };
 
 export async function getPullRequestRest(
