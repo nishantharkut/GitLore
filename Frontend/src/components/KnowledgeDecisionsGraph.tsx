@@ -8,6 +8,17 @@ import {
   saveKnowledgeLayoutCache,
 } from "@/lib/overviewSessionCache";
 
+/** Normalize owner/name the same way the backend builds `repo` on nodes. */
+function repoLayoutKey(owner: string, name: string) {
+  return `${owner}/${name}`.toLowerCase().replace(/^\/+|\/+$/g, "");
+}
+
+/**
+ * Survives Overview ↔ /app navigation: remounted component can paint the last good graph
+ * immediately and tolerate transient GET failures without showing “re-ingest” empty state.
+ */
+const knowledgeLayoutCache = new Map<string, KnowledgeLayoutResponse>();
+
 const EDGE_STROKE: Record<string, string> = {
   pr_pr_time: "rgba(148, 163, 184, 0.35)",
   pr_pr_issue: "rgba(52, 211, 153, 0.75)",
@@ -315,29 +326,48 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
   const [layout, setLayout] = useState<KnowledgeLayoutResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [modalZoom, setModalZoom] = useState(1);
   const [modalOpen, setModalOpen] = useState(false);
-  const prevRefreshKeyRef = useRef<number | null>(null);
+  const lastRepoKeyRef = useRef<string | null>(null);
+  const prevRefreshKeyRef = useRef(refreshKey);
 
   useEffect(() => {
     if (!repoReady) {
       setLayout(null);
-      setLoading(false);
       setErr(null);
+      setLoading(false);
+      lastRepoKeyRef.current = null;
       return;
     }
 
     const { owner, name } = target;
-    const prevRK = prevRefreshKeyRef.current;
-    const ingestInvalidated = prevRK !== null && prevRK !== refreshKey;
-    prevRefreshKeyRef.current = refreshKey;
+    const key = repoLayoutKey(owner, name);
+    const switchedRepo =
+      lastRepoKeyRef.current !== null && lastRepoKeyRef.current !== key;
+    lastRepoKeyRef.current = key;
 
-    if (ingestInvalidated) {
+    if (switchedRepo) {
+      setLayout(null);
+      setErr(null);
+    }
+
+    const refreshBumped = prevRefreshKeyRef.current !== refreshKey;
+    prevRefreshKeyRef.current = refreshKey;
+    if (refreshBumped) {
+      knowledgeLayoutCache.delete(key);
       clearKnowledgeLayoutCache(owner, name);
     }
 
-    const cached = ingestInvalidated ? null : loadKnowledgeLayoutCache(owner, name);
+    const cached =
+      !refreshBumped
+        ? knowledgeLayoutCache.get(key) ?? loadKnowledgeLayoutCache(owner, name)
+        : null;
+    if (cached?.nodes?.length) {
+      knowledgeLayoutCache.set(key, cached);
+    }
+
     let cancelled = false;
 
     if (cached?.nodes?.length) {
@@ -353,18 +383,23 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
     void fetchKnowledgeLayout(owner, name)
       .then((res) => {
         if (cancelled) return;
-        setLayout(res);
+        knowledgeLayoutCache.set(key, res);
         saveKnowledgeLayoutCache(owner, name, res);
+        setLayout(res);
         setErr(null);
       })
       .catch((e) => {
         if (cancelled) return;
-        if (cached?.nodes?.length) {
-          setErr(null);
-        } else {
-          setLayout(null);
-          setErr(e instanceof Error ? e.message : "Could not load knowledge graph");
-        }
+        const msg = e instanceof Error ? e.message : "Could not load knowledge graph";
+        setErr(msg);
+        setLayout((prev) => {
+          if (prev?.nodes?.length) return prev;
+          const fromMemory = knowledgeLayoutCache.get(key);
+          if (fromMemory?.nodes?.length) return fromMemory;
+          const fromLs = loadKnowledgeLayoutCache(owner, name);
+          if (fromLs?.nodes?.length) return fromLs;
+          return prev;
+        });
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -373,7 +408,7 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
     return () => {
       cancelled = true;
     };
-  }, [repoReady, target.owner, target.name, refreshKey]);
+  }, [repoReady, target.owner, target.name, refreshKey, retryTick]);
 
   const { w, h, edgeEls, nodeEls } = useGraphElements(layout);
 
@@ -438,19 +473,43 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
             Loading graph…
           </div>
         )}
-        {!showLoadingOverlay && err && (
-          <div className="flex min-h-[120px] items-center justify-center px-4 text-center text-sm text-gitlore-error">
-            {err}
+        {loading && hasGraph ? (
+          <p className="mb-2 text-center text-[11px] text-gitlore-text-secondary" role="status">
+            Refreshing graph…
+          </p>
+        ) : null}
+        {!loading && err && !hasGraph && (
+          <div className="flex min-h-[120px] flex-col items-center justify-center gap-2 px-4 text-center text-sm text-gitlore-error">
+            <p>{err}</p>
+            <button
+              type="button"
+              className="rounded-sm border border-gitlore-border px-3 py-1 text-xs text-gitlore-accent transition-colors hover:bg-gitlore-surface-hover"
+              onClick={() => setRetryTick((t) => t + 1)}
+            >
+              Retry
+            </button>
           </div>
         )}
-        {!showLoadingOverlay && !err && !hasGraph && (
+        {!loading && err && hasGraph && (
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-sm border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-gitlore-text-secondary">
+            <span>Could not refresh the graph ({err}). Showing the last successful load.</span>
+            <button
+              type="button"
+              className="shrink-0 rounded-sm border border-gitlore-border bg-gitlore-surface px-2 py-1 text-[11px] text-gitlore-accent transition-colors hover:bg-gitlore-surface-hover"
+              onClick={() => setRetryTick((t) => t + 1)}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {!loading && !err && !hasGraph && (
           <div className="flex min-h-[220px] flex-col items-center justify-center gap-2 px-6 text-center">
             <p className="text-sm text-gitlore-text-secondary">
               No ingested decisions yet. Run <span className="text-gitlore-text">Build Knowledge Graph</span> to index merged PRs.
             </p>
           </div>
         )}
-        {!showLoadingOverlay && !err && canRenderSvg && (
+        {canRenderSvg && (
           <>
             <div className="pointer-events-none absolute right-3 top-3 z-20 md:right-4 md:top-4">
               <ZoomToolbar
@@ -480,12 +539,7 @@ export function KnowledgeDecisionsGraph({ refreshKey = 0 }: { refreshKey?: numbe
           </>
         )}
 
-        {!showLoadingOverlay && !err && hasGraph && loading && (
-          <p className="mb-2 text-center text-[10px] text-gitlore-text-secondary/90" role="status">
-            Syncing latest graph from server…
-          </p>
-        )}
-        {!showLoadingOverlay && !err && hasGraph && (
+        {hasGraph && (
           <div className="mt-3 space-y-2 border-t border-gitlore-border/60 pt-3 text-[10px] text-gitlore-text-secondary">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span className="uppercase tracking-wider">PR types</span>
