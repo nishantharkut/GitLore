@@ -53,9 +53,6 @@ export function verifySession(signed: string): string {
 }
 
 /**
- * Authentication middleware for protected routes
- */
-/**
  * Session token from cookie (web) or Authorization Bearer / X-GitLore-Session (e.g. extension).
  * authMiddleware uses this so API routes accept the same session as the web cookie.
  */
@@ -72,6 +69,15 @@ export function getSessionToken(c: Context): string | undefined {
   return undefined;
 }
 
+function clearWebSessionCookieIfPresent(c: Context) {
+  if (getCookie(c, "gitlore_session")) {
+    deleteCookie(c, "gitlore_session");
+  }
+}
+
+/**
+ * Authentication middleware for protected routes (cookie or Bearer / X-GitLore-Session).
+ */
 export async function authMiddleware(c: Context, next: Next): Promise<void | Response> {
   try {
     if (c.req.method === "GET" && c.req.path === "/api/enforcement/policy") {
@@ -79,7 +85,7 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
       return;
     }
 
-    const session = getCookie(c, "gitlore_session");
+    const session = getSessionToken(c);
 
     if (!session) {
       return c.json({ error: "Unauthorized" }, 401);
@@ -88,8 +94,8 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
     let userId: string;
     try {
       userId = verifySession(session);
-    } catch (error) {
-      deleteCookie(c, "gitlore_session");
+    } catch {
+      clearWebSessionCookieIfPresent(c);
       return c.json({ error: "Invalid session" }, 401);
     }
 
@@ -99,7 +105,7 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
     });
 
     if (!user) {
-      deleteCookie(c, "gitlore_session");
+      clearWebSessionCookieIfPresent(c);
       return c.json({ error: "User not found" }, 401);
     }
 

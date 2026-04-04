@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { setCookie, deleteCookie, getCookie } from "hono/cookie";
+import { setCookie, deleteCookie } from "hono/cookie";
 import { getDB, ObjectId } from "../lib/mongo";
 import { getUserInfo } from "../lib/github";
 import { signSession, verifySession, getSessionToken } from "../middleware/auth";

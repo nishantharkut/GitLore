@@ -209,5 +209,6 @@
     }
   });
 
+  loadPosition();
   void refreshVisibility();
 })();
