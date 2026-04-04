@@ -14,6 +14,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 export const GEMINI_GENERATION_MODEL =
   process.env.GEMINI_GENERATION_MODEL?.trim() || "gemini-2.5-flash-lite";
 
+/** Prefer gemini-2.5-flash for PR comment explanations when set. */
+export const GEMINI_EXPLAIN_MODEL =
+  process.env.GEMINI_EXPLAIN_MODEL?.trim() || "gemini-2.5-flash";
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** True for HTTP 429 / RESOURCE_EXHAUSTED-style Gemini errors. */
@@ -95,10 +99,20 @@ export const explanationSchema = z.object({
   fix: z.string(),
   principle: z.string(),
   confidence: z.enum(["high", "medium", "low"]),
-  confidence_reason: z.string().optional(),
+  confidence_reason: z.string(),
+  docs_links: z.array(z.string()).optional(),
 });
 
 export type Explanation = z.infer<typeof explanationSchema>;
+
+export type ExplainCommentInput = {
+  comment: string;
+  diffHunk: string;
+  filePath: string;
+  language: string;
+  surroundingContext: string;
+  patternTemplate: string | null;
+};
 
 // Schema for narrative responses
 export const narrativeSchema = z.object({
@@ -138,37 +152,43 @@ export const narrativeSchema = z.object({
 
 export type Narrative = z.infer<typeof narrativeSchema>;
 
-/**
- * Generate explanation for a code review comment
- */
-export async function explainComment(
-  comment: string,
-  diffHunk: string,
-  filePath: string,
-  context: string
-): Promise<Explanation> {
-  const model = genAI.getGenerativeModel({ model: GEMINI_GENERATION_MODEL });
+const EXPLAIN_SYSTEM = `You are a code review mentor. Given a terse review comment and surrounding code context, explain exactly what is wrong in THIS specific code (not generically), why it matters in production, and provide the corrected code. Reference actual variable names and function names from the code shown. Under 150 words per field. Never be generic.`;
 
-  const prompt = `Respond ONLY with valid JSON (no other text).
+/**
+ * Generate explanation for a code review comment (Gemini 2.5 Flash structured JSON).
+ */
+export async function explainComment(input: ExplainCommentInput): Promise<Explanation> {
+  const model = genAI.getGenerativeModel({ model: GEMINI_EXPLAIN_MODEL });
+
+  const patternBlock = input.patternTemplate
+    ? `\nMatched pattern template:\n${input.patternTemplate}\n`
+    : "";
+
+  const prompt = `${EXPLAIN_SYSTEM}
+
+Respond ONLY with valid JSON (no other text).
 
 {
-  "pattern_name": "Anti-pattern name",
-  "whats_wrong": "What's wrong (use \\n for newlines)",
-  "why_it_matters": "Why it matters",
-  "fix": "Fixed code (use \\n for newlines, \\t for tabs)",
-  "principle": "Principle",
+  "pattern_name": "Short pattern title",
+  "whats_wrong": "What is wrong in this code (use \\\\n for newlines)",
+  "why_it_matters": "Production impact",
+  "fix": "Corrected code (use \\\\n for newlines)",
+  "principle": "One-line principle",
   "confidence": "high",
-  "confidence_reason": "Reason"
+  "confidence_reason": "Why this confidence level",
+  "docs_links": ["optional https://..."]
 }
 
-Review: "${comment}"
-File: ${filePath}
+Terse review comment: ${JSON.stringify(input.comment)}
+File path: ${input.filePath}
+Language (inferred): ${input.language}
 
-Problem code (use exactly as provided):
-${diffHunk}
+Diff hunk (added lines start with +, removed with -):
+${input.diffHunk}
 
-${context ? `Context: ${context}` : ""}
-
+Surrounding file context (±30 lines around the comment line):
+${input.surroundingContext || "(unavailable)"}
+${patternBlock}
 RESPOND IMMEDIATELY WITH JSON (nothing else):`;
 
   try {
@@ -191,6 +211,7 @@ RESPOND IMMEDIATELY WITH JSON (nothing else):`;
         principle: "Code Review",
         confidence: "low",
         confidence_reason: "Insufficient context provided",
+        docs_links: [],
       };
     }
 

@@ -29,12 +29,14 @@ realTestRouter.post("/real-explain", async (c) => {
     const context = body.context || "";
 
     // Generate real explanation using Gemini
-    const explanation = await explainComment(
+    const explanation = await explainComment({
       comment,
       diffHunk,
       filePath,
-      context
-    );
+      language: "typescript",
+      surroundingContext: context,
+      patternTemplate: null,
+    });
 
     // Also try pattern matching
     const patternMatch = matchAntiPattern(diffHunk, "typescript");
@@ -201,12 +203,14 @@ realTestRouter.post("/real-multi-pattern", async (c) => {
 
     for (const pattern of codePatterns) {
       try {
-        const explanation = await explainComment(
-          pattern.comment,
-          pattern.diff,
-          pattern.file,
-          `Pattern type: ${pattern.name}`
-        );
+        const explanation = await explainComment({
+          comment: pattern.comment,
+          diffHunk: pattern.diff,
+          filePath: pattern.file,
+          language: "typescript",
+          surroundingContext: "",
+          patternTemplate: `Pattern type: ${pattern.name}`,
+        });
 
         results.push({
           pattern_name: pattern.name,
