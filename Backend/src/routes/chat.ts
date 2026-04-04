@@ -334,10 +334,11 @@ chatRouter.post("/repo/:owner/:name/chat", async (c) => {
 
     let queryVector: number[] | null = null;
     try {
-      queryVector = await getEmbedding(question);
+      queryVector = await getEmbedding(question, "query");
     } catch {
       embeddingFailed = true;
     }
+    if (!queryVector) embeddingFailed = true;
 
     if (queryVector && !embeddingFailed) {
       try {

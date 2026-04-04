@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, TaskType } from "@google/generative-ai";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 
@@ -387,45 +387,56 @@ export function matchAntiPattern(
   return null;
 }
 
-function hashEmbedding(text: string): number[] {
-  const hash = text.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-  const vector: number[] = [];
-  for (let i = 0; i < 768; i++) {
-    vector.push(Math.sin((hash + i) * 0.1) * 0.5 + 0.5);
+/** Comma-separated in GEMINI_EMBEDDING_MODELS; default matches KNOWLEDGE_GRAPH docs (gemini-embedding-001). */
+function embeddingModelCandidates(): string[] {
+  const raw = process.env.GEMINI_EMBEDDING_MODELS?.trim();
+  if (raw) {
+    const list = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (list.length) return list;
   }
-  return vector;
+  return ["gemini-embedding-001"];
 }
 
+export type EmbeddingRole = "query" | "document";
+
 /**
- * Embeddings for knowledge retrieval (query + stored nodes). Uses Gemini when GEMINI_API_KEY is set.
+ * Real embeddings only (no hash fallback). Returns null if no API key or all models fail —
+ * callers must fall back to $text / regex (see KNOWLEDGE_GRAPH_FOLLOWUP.md §4).
  */
-export async function getEmbedding(text: string): Promise<number[]> {
+export async function getEmbedding(
+  text: string,
+  role: EmbeddingRole = "query"
+): Promise<number[] | null> {
   const key = process.env.GEMINI_API_KEY?.trim();
-  if (!key) return hashEmbedding(text);
+  if (!key) return null;
 
   const chunk = text.slice(0, 8000);
-  const candidates = ["text-embedding-004", "embedding-001"];
-  for (const modelName of candidates) {
+  const taskType =
+    role === "query" ? TaskType.RETRIEVAL_QUERY : TaskType.RETRIEVAL_DOCUMENT;
+
+  for (const modelName of embeddingModelCandidates()) {
     try {
       const model = genAI.getGenerativeModel({ model: modelName });
-      const m = model as unknown as {
-        embedContent?: (
-          input: string | { content: { parts: { text: string }[] } }
-        ) => Promise<{ embedding?: { values?: number[] } }>;
-      };
-      if (typeof m.embedContent !== "function") continue;
-
-      let res: { embedding?: { values?: number[] } } | undefined;
+      let res: { embedding?: { values?: number[] } };
       try {
-        res = await m.embedContent({ content: { parts: [{ text: chunk }] } });
+        res = await model.embedContent({
+          content: { role: "user", parts: [{ text: chunk }] },
+          taskType,
+        });
       } catch {
-        res = await m.embedContent(chunk);
+        res = await model.embedContent({
+          content: { role: "user", parts: [{ text: chunk }] },
+          taskType,
+        });
       }
       const values = res?.embedding?.values;
       if (Array.isArray(values) && values.length > 0) return values;
-    } catch {
-      /* try next model */
+    } catch (err) {
+      console.warn(`getEmbedding model ${modelName} failed:`, err instanceof Error ? err.message : err);
     }
   }
-  return hashEmbedding(text);
+  return null;
 }

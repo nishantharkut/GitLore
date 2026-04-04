@@ -120,6 +120,13 @@ export async function fetchMergedPRs(
         cursor,
       });
 
+      if (Array.isArray(result?.errors) && result.errors.length > 0) {
+        const msg = result.errors.map((e: { message?: string }) => e.message).join("; ");
+        if (/rate limit|RATE_LIMIT|API rate limit exceeded/i.test(msg)) {
+          throw new Error(`GitHub GraphQL rate limit: ${msg}`);
+        }
+      }
+
       const connection = result.repository?.pullRequests;
       if (!connection?.nodes?.length) break;
 
@@ -265,31 +272,24 @@ Rules:
   return knowledgeNodeSchema.parse(parsed);
 }
 
-export async function generateRealEmbedding(text: string): Promise<number[]> {
-  const candidates = ["text-embedding-004", "embedding-001"];
-  for (const modelName of candidates) {
-    try {
-      const model = genAI.getGenerativeModel({ model: modelName as any });
-      const embedFn = (model as any).embedContent;
-      if (typeof embedFn === "function") {
-        const res = await embedFn.call(model, text);
-        const values = res?.embedding?.values;
-        if (Array.isArray(values) && values.length > 0) return values;
-      }
-    } catch {
-      /* try next */
-    }
-  }
-  return generateHashEmbedding(text);
+function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/429|rate\s*limit|resource_exhausted|too many requests/i.test(msg)) return true;
+  const code = (err as { status?: number; code?: number })?.status ?? (err as { code?: number })?.code;
+  return code === 429;
 }
 
-function generateHashEmbedding(text: string): number[] {
-  const hash = text.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-  const vector: number[] = [];
-  for (let i = 0; i < 768; i++) {
-    vector.push(Math.sin((hash + i) * 0.1) * 0.5 + 0.5);
+/** KNOWLEDGE_GRAPH_FOLLOWUP.md §3.2: wait 10s and retry once on Gemini 429. */
+async function withGemini429Retry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (isRateLimitError(e)) {
+      await new Promise((r) => setTimeout(r, 10_000));
+      return await fn();
+    }
+    throw e;
   }
-  return vector;
 }
 
 export interface IngestProgress {
@@ -356,9 +356,11 @@ export async function ingestRepo(
 
       const results = await Promise.allSettled(
         batch.map(async (pr) => {
-          const knowledge = await extractKnowledge(pr);
-          const embeddingText = `${knowledge.title}. ${knowledge.summary}. ${knowledge.problem}`;
-          const embedding = await getEmbedding(embeddingText);
+          const knowledge = await withGemini429Retry(() => extractKnowledge(pr));
+          const topics = (knowledge.topics || []).join(", ");
+          const embeddingText =
+            `${knowledge.title}. ${knowledge.summary}. ${knowledge.decision}. Topics: ${topics}`.trim();
+          const embedding = await getEmbedding(embeddingText, "document");
           const full_narrative = [
             knowledge.title,
             knowledge.summary,
@@ -394,7 +396,7 @@ export async function ingestRepo(
             merge_commit,
             ...knowledge,
             full_narrative,
-            embedding,
+            embedding: embedding ?? null,
             created_at: new Date(),
           };
 
@@ -445,7 +447,13 @@ export async function ingestRepo(
       }
     }
 
-    progress.status = "done";
+    if (progress.total === 0) {
+      progress.status = "done";
+    } else if (progress.processed === 0) {
+      progress.status = "error";
+    } else {
+      progress.status = "done";
+    }
   } catch (error) {
     progress.status = "error";
     pushError(
